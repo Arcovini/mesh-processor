@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Secrets and local state — never bake into the image
+.env
+.env.local
+
+# Tests / scratch
+test_output/
+*.stl
+*.glb
+
+# VCS / editor
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# Docs/meta that don't need to run in the container
+CLAUDE.md
