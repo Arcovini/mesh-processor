@@ -59,6 +59,9 @@ def upload_model(glb_bytes: bytes, name: str, token: str) -> str:
             "source": "biodesignlab",
             "isPublished": "true",
             "private": "false",
+            # Downloadable models don't count against the Basic plan's 10/month cap.
+            # See https://sketchfab.com/plans — "A model that is downloadable doesn't count against this limit."
+            "isDownloadable": "true",
         },
         timeout=UPLOAD_TIMEOUT_S,
     )

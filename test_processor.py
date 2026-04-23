@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 
+from main import clean_mesh_names
 from processor import process_stls
 
 SAMPLES_DIR = Path("/Users/viniciusarcoverde/Downloads/Reynaldo Real Martins Junior 2")
@@ -21,10 +22,12 @@ def main() -> int:
         print(f"No STLs found in {SAMPLES_DIR}", file=sys.stderr)
         return 1
 
-    files = [(p.stem, p.read_bytes()) for p in stls]
+    raw_names = [p.name for p in stls]
+    clean_names = clean_mesh_names(raw_names)
+    files = [(clean, p.read_bytes()) for clean, p in zip(clean_names, stls)]
     print(f"Building combined GLB from {len(files)} STLs:")
-    for name, data in files:
-        print(f"  - {name} ({len(data)/1024:.1f} KB)")
+    for raw, (clean, data) in zip(raw_names, files):
+        print(f"  - {raw}  ->  {clean!r} ({len(data)/1024:.1f} KB)")
 
     t0 = time.perf_counter()
     glb_bytes, stats = process_stls(files)
