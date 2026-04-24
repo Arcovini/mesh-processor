@@ -82,9 +82,21 @@ def _load_and_decimate(
     stl_bytes: bytes, target_triangles: int
 ) -> tuple[trimesh.Trimesh, int, bool]:
     try:
-        mesh = trimesh.load(io.BytesIO(stl_bytes), file_type="stl", process=True)
+        loaded = trimesh.load(io.BytesIO(stl_bytes), file_type="stl", process=True)
     except Exception as e:
         raise ValueError(f"STL inválido ou corrompido: {e}") from e
+
+    # STL multi-body (vários `solid`/`endsolid`) volta como Scene. Concatenamos
+    # todas as partes numa única Trimesh — para nós, um STL = uma estrutura
+    # anatômica, mesmo quando o software de segmentação exporta em pedaços
+    # desconectados. A decimação abaixo já cuida da contagem total de triângulos.
+    if isinstance(loaded, trimesh.Scene):
+        parts = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not parts:
+            raise ValueError("STL não contém nenhuma malha utilizável.")
+        mesh = trimesh.util.concatenate(parts)
+    else:
+        mesh = loaded
 
     if not isinstance(mesh, trimesh.Trimesh):
         raise ValueError("Arquivo STL não pôde ser carregado como uma única malha.")
