@@ -50,11 +50,13 @@ The Dockerfile installs `build-essential` because `fast-simplification` compiles
 
 ### Deployment
 
-Hosted on Railway. Push to `main` triggers auto-deploy. Railway auto-detects the Dockerfile and uses it. Required env vars (set in the Railway dashboard):
+Hosted on Railway **transitionally**. Push to `main` triggers auto-deploy. Railway auto-detects the Dockerfile and uses it. Required env vars (set in the Railway dashboard):
 - `SKETCHFAB_TOKEN` — Sketchfab API token (secret)
 - `VIEWER_BASE` — defaults to `https://biodesignlab.com.br/case/`
 - `PORT` — set automatically by Railway
 - `DRY_RUN` — leave unset (or `false`) in production
+
+**Future host: Google Cloud Run** when migration triggers fire (LGPD pressure, GPU need for Sprint 4+, or cost crossover). Because this service runs entirely from `Dockerfile` with env vars at the edges, the migration is primarily learning `gcloud` CLI and re-setting env vars in the target dashboard. See the workspace-level `CLAUDE.md` for the full hosting strategy and triggers.
 
 ## Architecture
 
