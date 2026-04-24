@@ -92,6 +92,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://biodesignlab.com.br",
+        # VSCode "Live Server" (default port 5500), plus common variants.
+        # 127.0.0.1 and localhost are distinct origins to the browser.
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+        "http://127.0.0.1:5501",
         "http://localhost:5501",
     ],
     allow_methods=["GET", "POST", "OPTIONS"],

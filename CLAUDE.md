@@ -148,7 +148,7 @@ Response on 201 Created: `{"uid": "..."}`. Status endpoint response: `status.pro
 
 ### CORS
 
-Only `https://biodesignlab.com.br` and `http://localhost:5501` (Live Server in the viewer repo) are allowed. Add new origins explicitly — do not use `*`.
+Only `https://biodesignlab.com.br` and the four local Live Server variants (`http://127.0.0.1:5500`, `http://localhost:5500`, `http://127.0.0.1:5501`, `http://localhost:5501`) are allowed. VSCode's Live Server defaults to `127.0.0.1:5500` — `127.0.0.1` and `localhost` are distinct origins to the browser, so both must be listed. Add new origins explicitly; do not use `*`.
 
 ## Code patterns
 
