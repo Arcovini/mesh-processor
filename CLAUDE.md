@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Its single responsibility: receive raw STL files (typically generated from medical imaging segmentation), optimize them for web viewing, and publish them to Sketchfab so they can be loaded by the existing static viewer at `https://biodesignlab.com.br/case/?id=<UID>`.
 
-This service is **Sprint 1** of a broader migration plan. See "Roadmap" below — design decisions here exist to make Sprints 2 and 3 painless. Do not collapse abstractions that exist for that reason.
+This service was built in **Sprint 1** (Sketchfab as the only destination) and extended in **Sprint 2** (parallel push to Cloudflare R2). See "Roadmap" below — design decisions here exist to make Sprint 3 (viewer migration off Sketchfab) painless. Do not collapse abstractions that exist for that reason.
 
 A single `/upload` request accepts **multiple STLs** at once (one clinical case = N anatomical structures) and produces **one** GLB containing each STL as a named mesh node. The viewer's `getNodeMap` uses those names to render per-structure toggles and opacity sliders.
 
@@ -52,9 +52,13 @@ The Dockerfile installs `build-essential` because `fast-simplification` compiles
 
 Hosted on Railway **transitionally**. Push to `main` triggers auto-deploy. Railway auto-detects the Dockerfile and uses it. Required env vars (set in the Railway dashboard):
 - `SKETCHFAB_TOKEN` — Sketchfab API token (secret)
+- `R2_ACCOUNT_ID` — Cloudflare account identifier (secret-ish; non-authenticating but unique to the account)
+- `R2_ACCESS_KEY_ID` — R2 token Access Key (secret)
+- `R2_SECRET_ACCESS_KEY` — R2 token Secret (secret)
+- `R2_BUCKET` — defaults to `clinical-3d` if unset
 - `VIEWER_BASE` — defaults to `https://biodesignlab.com.br/case/`
 - `PORT` — set automatically by Railway
-- `DRY_RUN` — leave unset (or `false`) in production
+- `DRY_RUN` — leave unset (or `false`) in production. Boot fails loudly if any of the SKETCHFAB / R2 secrets are missing while DRY_RUN is off, by design.
 
 **Future host: Google Cloud Run** when migration triggers fire (LGPD pressure, GPU need for Sprint 4+, or cost crossover). Because this service runs entirely from `Dockerfile` with env vars at the edges, the migration is primarily learning `gcloud` CLI and re-setting env vars in the target dashboard. See the workspace-level `CLAUDE.md` for the full hosting strategy and triggers.
 
@@ -67,8 +71,9 @@ mesh-processor/
 ├── main.py          # FastAPI app — /upload, /status, /health. Pure orchestration.
 ├── processor.py     # STL(s) → scene → multi-mesh GLB (pure, testable, no I/O)
 ├── sketchfab.py     # Sketchfab API client. Thin. DRY_RUN short-circuit inside.
+├── r2.py            # Cloudflare R2 client (S3-compatible via boto3). Thin. DRY_RUN short-circuit inside.
 ├── test_processor.py  # Informal smoke test against real STLs (not pytest)
-├── .env.example     # Template for SKETCHFAB_TOKEN, VIEWER_BASE, DRY_RUN
+├── .env.example     # Template for SKETCHFAB_TOKEN, VIEWER_BASE, R2_*, DRY_RUN
 ├── Dockerfile
 ├── .dockerignore
 └── requirements.txt
@@ -76,17 +81,17 @@ mesh-processor/
 
 ### Critical separation: processor vs destination
 
-`processor.py` knows nothing about Sketchfab. `sketchfab.py` knows nothing about meshes. This is intentional. In Sprint 2 a sibling `r2.py` will be added to upload to Cloudflare R2 in parallel; in Sprint 3 Sketchfab will be removed entirely. **Do not couple them.**
+`processor.py` knows nothing about Sketchfab or R2. `sketchfab.py` and `r2.py` know nothing about meshes. This is intentional. Sprint 2 added `r2.py` as a sibling to `sketchfab.py` to upload to Cloudflare R2 in parallel; Sprint 3 will remove Sketchfab entirely. **Do not couple them.**
 
-The same separation has a second payoff: `processor.py` returns `bytes`, not a file path. In Sprint 2 those bytes go to **two** destinations simultaneously (Sketchfab + R2) with zero processor changes. Keeping intermediates in memory costs ~10MB per request and saves the duplication.
+The same separation pays off: `processor.py` returns `bytes`, not a file path. Those bytes go to **two** destinations simultaneously (Sketchfab + R2) with zero processor changes. Keeping intermediates in memory costs ~10MB per request and saves the duplication.
 
 ### Pure vs effectful split
 
 `processor.py` is a **pure** module — `bytes in → bytes out`, no I/O, no env vars, no network. Call it 1000 times with the same input and it returns the same output. Testable without any setup.
 
-`sketchfab.py` is **effectful** — it mutates the world (creates models on Sketchfab, consumes quota). That's why it has a DRY_RUN short-circuit: we want to exercise every layer above it (endpoint, CORS, the eventual upload page) without actually triggering effects until we're ready.
+`sketchfab.py` and `r2.py` are **effectful** — they mutate the world (create Sketchfab models / write R2 objects, consume quota and ops). That's why both have a DRY_RUN short-circuit: we want to exercise every layer above them (endpoint, CORS, the upload page, parallel orchestration in `main.py`) without actually triggering effects until we're ready.
 
-The rule: separate computation from side effects at file boundaries. Testing the pure part is free; testing the effectful part costs slots/dollars/time and should be done sparingly.
+The rule: separate computation from side effects at file boundaries. Testing the pure part is free; testing the effectful parts costs slots/dollars/time and should be done sparingly.
 
 ### Mesh processing decisions (medical context)
 
@@ -148,6 +153,24 @@ Non-matched names cycle through an IBM Colorblind Safe palette (`FALLBACK_COLORS
 
 Response on 201 Created: `{"uid": "..."}`. Status endpoint response: `status.processing` is `SUCCEEDED` when ready.
 
+### Cloudflare R2 integration notes
+
+R2 is the parallel storage backend added in Sprint 2. Why R2 (and not S3/GCS) lives in the workspace-level `CLAUDE.md` under "Hosting strategy" — short version: zero egress cost on Cloudflare's network, S3-compatible API so the SDK is just `boto3` pointed at a different `endpoint_url`, and a generous always-free tier (10GB storage, 1M Class A ops/month, 10M Class B ops/month).
+
+**Object key convention:** `cases/{uid}.glb`. Same UID as the Sketchfab one for now (in Sprint 3 we may mint our own UIDs once Sketchfab is gone). The `cases/` prefix exists so the bucket can later host non-case objects (thumbnails, JSON metadata, exports) without name collisions.
+
+**Failure semantics: best-effort.** `main.py` calls `r2.upload_glb(...)` *after* the Sketchfab upload succeeds, inside a `try/except R2Error` that logs `[r2 ERROR] ...` and continues. The clinician's request still returns 200 — Sketchfab is the source of truth in Sprint 2 and the viewer URL works regardless of R2. Rationale: R2 is a backup whose absence does not block the clinical workflow today. Sprint 3 will tighten this when the viewer starts reading from R2 directly.
+
+**Token scope (least privilege).** The R2 token used in production has permission "Object Read & Write" scoped to the single bucket `clinical-3d`. It cannot list, create, or delete buckets, and cannot touch other buckets in the account. If the token leaks, the blast radius is bounded to objects within `clinical-3d` (which we can re-upload from Sketchfab anyway).
+
+**Endpoint URL is derived, not configured.** `r2.py` builds `https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com` from the account id. This is the default (auto/global) R2 endpoint — works because we picked "Localização: Automática" at bucket creation time. If a future bucket uses jurisdictional restriction (EU, FedRAMP), the endpoint format changes and this assumption breaks.
+
+**`region_name="auto"`.** R2 has no real regions, but `boto3` requires `region_name` to construct request signatures. Cloudflare accepts `"auto"` (canonical) or any AWS-region-like string. Don't change this without a reason.
+
+**`ContentType="model/gltf-binary"`.** Set on every put. Important for Sprint 3 — when the viewer fetches `cases/{uid}.glb` over HTTP, the browser uses Content-Type to route the bytes to the right loader. Wrong Content-Type now = bug deferred to Sprint 3.
+
+**No retries in `r2.py`.** Same thin-client rule as `sketchfab.py`: HTTP + response parsing, nothing else. boto3's default retry behavior is left in place (it handles transient 503s with backoff internally), but we add no retry loops of our own. If we later observe lots of transient failures and want explicit retry policy, add it in `main.py` orchestration, not in the client.
+
 ### CORS
 
 Only `https://biodesignlab.com.br` and the four local Live Server variants (`http://127.0.0.1:5500`, `http://localhost:5500`, `http://127.0.0.1:5501`, `http://localhost:5501`) are allowed. VSCode's Live Server defaults to `127.0.0.1:5500` — `127.0.0.1` and `localhost` are distinct origins to the browser, so both must be listed. Add new origins explicitly; do not use `*`.
@@ -157,17 +180,21 @@ Only `https://biodesignlab.com.br` and the four local Live Server variants (`htt
 - **FastAPI with type hints.** Use `Form()`, `UploadFile`, and Pydantic models for request validation. Return plain dicts for responses (FastAPI handles serialization).
 - **Errors as HTTPException with clear messages.** The frontend surfaces these directly to clinicians, so keep them human-readable in Portuguese where user-facing. Ex: `raise HTTPException(400, "STL inválido ou corrompido: ...")`.
 - **No background workers / queues yet.** Processing happens synchronously in the request. Multi-STL cases process in <1s plus the Sketchfab upload RTT (~1-2s). If we add larger inputs or batch processing, revisit with Celery + Redis.
-- **Stateless service.** No database. Sketchfab is the source of truth for uploaded models. Sprint 2 will add R2 as a parallel store but still no DB until metadata requirements appear.
+- **Stateless service.** No database. Sketchfab remains the source of truth for uploaded models in Sprint 2; R2 is the parallel backup. Still no DB until metadata requirements appear.
 - **Pure functions in `processor.py`.** Takes bytes, returns bytes + stats. No I/O, no env vars. Makes it trivially testable and reusable.
-- **Thin clients** (currently just `sketchfab.py`; future `r2.py` will follow the same shape). Only HTTP + response parsing. No retry loops, no caching, no polling. Orchestration (retry, concurrency, cross-destination logic) lives in `main.py`. A thin client is cheap to delete when Sprint 3 removes Sketchfab.
+- **Thin clients** (`sketchfab.py` and `r2.py`, both following the same shape). Only HTTP + response parsing. No retry loops, no caching, no polling. Orchestration (retry, concurrency, cross-destination logic, failure tolerance) lives in `main.py`. A thin client is cheap to delete when Sprint 3 removes Sketchfab.
 
 ### DRY_RUN pattern
 
-The `DRY_RUN=true` env var short-circuits `sketchfab.upload_model` / `sketchfab.get_status` inside the same file, a few lines from the real call. It returns a known-working Sketchfab UID by default (configurable via `DRY_RUN_UID` env), so the resulting `viewer_url` actually resolves in the browser — perfect for testing the upload page, CORS, and the full UX loop without burning slots.
+The `DRY_RUN=true` env var short-circuits **both** effectful clients:
+- `sketchfab.upload_model` / `sketchfab.get_status` return a known-working Sketchfab UID by default (configurable via `DRY_RUN_UID` env), so the resulting `viewer_url` actually resolves in the browser.
+- `r2.upload_glb` logs `[r2 DRY_RUN] upload '<key>' (<bytes>) -> bucket=<bucket>` and returns without calling the R2 API.
 
-`DRY_RUN=true` also lets the service boot without `SKETCHFAB_TOKEN` — useful for CI and for hand-off to new contributors who don't have a token yet. Production must never set `DRY_RUN=true`.
+That's enough to exercise the upload page, CORS, and the full UX loop end-to-end without burning slots or R2 ops.
 
-The fake/real paths living in the same file is deliberate: if the real Sketchfab API shape changes, the DRY_RUN branch is right there, three lines away, and gets updated in the same diff. A separate mock file would drift silently.
+`DRY_RUN=true` also lets the service boot without **any** of `SKETCHFAB_TOKEN`, `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, or `R2_SECRET_ACCESS_KEY` — useful for CI and for hand-off to new contributors who don't have credentials yet. Production must never set `DRY_RUN=true`.
+
+The fake/real paths living in the same file is deliberate: if a real API's shape changes (Sketchfab response format, R2 endpoint URL convention, etc.), the DRY_RUN branch is right there, a few lines away, and gets updated in the same diff. A separate mock file would drift silently.
 
 ### Error handling inside `processor.py`
 
@@ -179,9 +206,9 @@ Transitive deps worth knowing about:
 
 ## Roadmap (do not break these paths)
 
-- **Sprint 1 (current):** STL → optimized GLB → Sketchfab. Viewer URL pattern unchanged.
-- **Sprint 2:** Add `r2.py`. After Sketchfab upload succeeds, also push GLB to Cloudflare R2 at `cases/{uid}.glb`. Same UID, two storage backends.
-- **Sprint 3:** Rewrite `medCaseViewer/case/` from Sketchfab iframe to native Three.js + GLTFLoader reading from R2. Sketchfab becomes optional/removed. Public URL (`?id=...`) stays identical — clinicians with old links keep working.
+- **Sprint 1 ✅:** STL → optimized GLB → Sketchfab. Viewer URL pattern unchanged.
+- **Sprint 2 ✅:** `r2.py` added. After Sketchfab upload succeeds, also push GLB to Cloudflare R2 at `cases/{uid}.glb` (best-effort — R2 failure does not break the request). Same UID, two storage backends.
+- **Sprint 3 (next):** Rewrite `medCaseViewer/case/` from Sketchfab iframe to native Three.js + GLTFLoader reading from R2. Sketchfab becomes optional/removed. Public URL (`?id=...`) stays identical — clinicians with old links keep working.
 - **Future (after AI pipeline):** A separate `ai-segmentation` service will produce STLs from DICOM and POST them to this service's `/upload` endpoint. This service does not need to know whether the STL came from a human upload or an AI run.
 
 The canonical, cross-service version of this roadmap lives in the workspace-level `CLAUDE.md` (one folder up). If the two ever disagree, that one wins.

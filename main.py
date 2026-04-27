@@ -16,6 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from processor import DEFAULT_TARGET_TRIANGLES, process_stls
+from r2 import R2Error, upload_glb
 from sketchfab import SketchfabError, get_status, upload_model
 
 
@@ -80,11 +81,24 @@ DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in ("true", "1", "yes")
 SKETCHFAB_TOKEN = os.getenv("SKETCHFAB_TOKEN", "")
 VIEWER_BASE = os.getenv("VIEWER_BASE", "https://biodesignlab.com.br/case/")
 
-if not DRY_RUN and not SKETCHFAB_TOKEN:
-    raise RuntimeError(
-        "SKETCHFAB_TOKEN é obrigatório quando DRY_RUN não está ativo. "
-        "Exporte o token ou rode com DRY_RUN=true para desenvolvimento."
-    )
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET = os.getenv("R2_BUCKET", "clinical-3d")
+
+if not DRY_RUN:
+    _required = {
+        "SKETCHFAB_TOKEN": SKETCHFAB_TOKEN,
+        "R2_ACCOUNT_ID": R2_ACCOUNT_ID,
+        "R2_ACCESS_KEY_ID": R2_ACCESS_KEY_ID,
+        "R2_SECRET_ACCESS_KEY": R2_SECRET_ACCESS_KEY,
+    }
+    _missing = [name for name, value in _required.items() if not value]
+    if _missing:
+        raise RuntimeError(
+            f"Variáveis obrigatórias ausentes em produção: {', '.join(_missing)}. "
+            "Configure-as ou rode com DRY_RUN=true para desenvolvimento."
+        )
 
 app = FastAPI(title="mesh-processor", version="0.1.0")
 
@@ -145,6 +159,23 @@ async def upload(
         uid = upload_model(glb_bytes, name=sketchfab_name, token=SKETCHFAB_TOKEN)
     except SketchfabError as e:
         raise HTTPException(502, str(e))
+
+    # Best-effort parallel push to R2. Sketchfab is the source of truth in
+    # Sprint 2; R2 is a backup that Sprint 3 will migrate the viewer to.
+    # Failures here log loudly but do not break the request — the clinician
+    # already has a working viewer link via Sketchfab.
+    try:
+        upload_glb(
+            glb_bytes,
+            uid=uid,
+            bucket=R2_BUCKET,
+            account_id=R2_ACCOUNT_ID,
+            access_key=R2_ACCESS_KEY_ID,
+            secret_key=R2_SECRET_ACCESS_KEY,
+        )
+        print(f"[r2] uploaded cases/{uid}.glb")
+    except R2Error as e:
+        print(f"[r2 ERROR] failed cases/{uid}.glb: {e}")
 
     return {
         "uid": uid,
