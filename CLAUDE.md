@@ -111,12 +111,16 @@ These defaults exist because this is **medical/surgical data**, not generic 3D c
 | Keyword substring | Color | Meaning |
 |---|---|---|
 | `art` | `#BD0006` | artéria (dark red) |
-| `veia` | `#458DE7` | veia (blue) |
+| `vei` | `#477EFF` | veia / vein (blue) |
 | `rim` | `#BA5531` | rim (brown-orange) |
 | `lesao` | `#08E700` | lesão (bright green) |
+| `tumor` | `#08E700` | tumor (same green as lesão — shares bucket, see below) |
 | `pele` | `#C4908E` | pele (skin pink) |
+| `cortex` | `#966830` | córtex (brown) |
 
 Non-matched names cycle through an IBM Colorblind Safe palette (`FALLBACK_COLORS`) by index — deterministic, so the same name consistently gets the same color. To add/change a clinical category, edit `COLORS_BY_KEYWORD`; don't touch the fallback palette lightly — reordering it reshuffles colors for unmatched cases.
+
+**Duplicates share a "color bucket" and get HSV-varied.** When two or more meshes resolve to the same base hex (two `art`-prefixed structures, or `lesao` + `tumor` in the same case, or fallback palette wrapping past index 4), `_vary_hsv` walks each duplicate through progressively darker V with alternating S offsets. The first occurrence keeps the base color; subsequent ones stay visually distinguishable in the viewer's toggle list without losing the clinical meaning of the hue. Bucketing is per-hex, not per-keyword, which is why `tumor` mapping to the same green as `lesao` works correctly out of the box.
 
 ### Required: force vertex-normal compute after transforms
 
