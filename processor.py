@@ -285,6 +285,20 @@ def process_obj_bundle(
 
         input_tris = len(mesh.faces)
 
+        # Guard against silent texture loss. trimesh's OBJ loader treats Pillow
+        # as an optional dependency: without it (or if the MTL image resolution
+        # fails for any other reason), the load succeeds but `material.image`
+        # is None, and the GLB exporter drops the baseColorTexture without a
+        # single warning. The viewer then renders monochrome and the regression
+        # only shows up in the browser. Failing loudly here pushes the bug to
+        # the upload response where it's debuggable.
+        image = getattr(mesh.visual.material, "image", None) if hasattr(mesh.visual, "material") else None
+        if image is None:
+            raise ValueError(
+                "Textura do OBJ não pôde ser carregada — verifique se o MTL referencia "
+                "uma imagem (.jpg/.png) e se ela foi enviada junto."
+            )
+
         # Meters → millimeters. Applied via a uniform scale matrix so UVs and
         # the TextureVisuals stay intact (a direct vertex multiply would also
         # work but applying as a transform is the idiomatic trimesh way and

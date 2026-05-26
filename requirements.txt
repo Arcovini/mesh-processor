@@ -8,3 +8,8 @@ numpy==2.1.3
 scipy==1.14.1
 chardet==5.2.0
 boto3==1.35.0
+# Pillow é dependência *opcional* do trimesh — sem ela, o loader de OBJ+MTL
+# descarta a textura silenciosamente (baseColorTexture vira None no GLB).
+# Pinada explicitamente porque o caminho de upload OBJ depende disso e nada
+# mais na lista a puxa transitivamente.
+Pillow==11.0.0
