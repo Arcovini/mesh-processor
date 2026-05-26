@@ -6,11 +6,19 @@ Takes one or more (name, stl_bytes) pairs, builds a single GLB containing each
 STL as a named mesh node with its own PBR material (so the viewer's opacity
 slider — which acts on materials — works per-structure). Coordinates are
 rotated from RAS (Z-up, medical convention) to glTF (Y-up).
+
+Also exposes `process_obj_bundle` for OBJ + MTL + texture image uploads
+(photogrammetry-style scans). That path skips decimation (decimation would
+break UV mapping), skips the keyword color logic (the user wants the original
+texture), and scales meters → millimeters (KIRI-style scanners output meters
+while the viewer assumes 1 unit = 1 mm everywhere).
 """
 from __future__ import annotations
 
 import colorsys
 import io
+import os
+import tempfile
 from dataclasses import dataclass, field
 
 import fast_simplification
@@ -201,3 +209,128 @@ def process_stls(
         glb_size_bytes=len(glb_bytes),
         meshes=mesh_stats,
     )
+
+
+# KIRI Engine and most photogrammetry exporters use meters. The viewer assumes
+# 1 unit = 1 mm (measurement.js treats distanceTo() as mm directly, ar.js bakes
+# a 0.001 scale into the USDZ). Multiply OBJ vertices by 1000 so a 0.7m skull
+# scan ends up at 700mm — measurable in the same units as the medical STLs.
+_OBJ_METERS_TO_MM = 1000.0
+
+
+def process_obj_bundle(
+    obj_bytes: bytes,
+    mtl_bytes: bytes,
+    textures: dict[str, bytes],
+    name: str,
+) -> tuple[bytes, ProcessStats]:
+    """Build a GLB from an OBJ + MTL + texture image bundle.
+
+    `textures` maps image filename (as referenced in the MTL's `map_Kd`, etc.)
+    to bytes. trimesh resolves these via the filesystem, so we materialize the
+    bundle in a temp dir, load by path, then drop the temp dir.
+
+    No decimation (would break UVs). No color override (preserve the texture).
+    No RAS→Y-up rotation (OBJ photogrammetry is already Y-up).
+    """
+    if not obj_bytes:
+        raise ValueError("Arquivo OBJ vazio.")
+    if not mtl_bytes:
+        raise ValueError("Arquivo MTL ausente — necessário para a textura.")
+    if not textures:
+        raise ValueError("Imagem(s) de textura ausente(s).")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        obj_path = os.path.join(tmpdir, "model.obj")
+        # The OBJ references its MTL by the `mtllib` directive (which is a
+        # filename, not a path). Rewriting that name to a known value lets us
+        # control the layout without parsing the OBJ.
+        rewritten_obj = _rewrite_mtllib(obj_bytes, "model.mtl")
+        with open(obj_path, "wb") as f:
+            f.write(rewritten_obj)
+        with open(os.path.join(tmpdir, "model.mtl"), "wb") as f:
+            f.write(mtl_bytes)
+        for tex_name, tex_data in textures.items():
+            # Sanitize: only the basename matters for trimesh's resolver, and
+            # we don't want a malicious bundle to write outside tmpdir.
+            safe = os.path.basename(tex_name)
+            if not safe:
+                continue
+            with open(os.path.join(tmpdir, safe), "wb") as f:
+                f.write(tex_data)
+
+        try:
+            loaded = trimesh.load(obj_path, process=True)
+        except Exception as e:
+            raise ValueError(f"OBJ inválido ou corrompido: {e}") from e
+
+        # OBJ can be one Trimesh (single `o`) or a Scene (multiple `o` directives).
+        # Multi-`o` with distinct materials would lose textures on concatenation,
+        # so we reject it in v1 — KIRI and similar tools always export a single
+        # object so this is a clear "you uploaded the wrong thing" signal.
+        if isinstance(loaded, trimesh.Scene):
+            parts = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+            if not parts:
+                raise ValueError("OBJ não contém nenhuma malha utilizável.")
+            if len(parts) > 1:
+                raise ValueError(
+                    "OBJ com múltiplos objetos não suportado — envie um único modelo."
+                )
+            mesh = parts[0]
+        else:
+            mesh = loaded
+
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise ValueError("Arquivo OBJ não pôde ser carregado como uma única malha.")
+
+        input_tris = len(mesh.faces)
+
+        # Meters → millimeters. Applied via a uniform scale matrix so UVs and
+        # the TextureVisuals stay intact (a direct vertex multiply would also
+        # work but applying as a transform is the idiomatic trimesh way and
+        # keeps any future per-mesh transforms composable).
+        mesh.apply_scale(_OBJ_METERS_TO_MM)
+        # Force vertex_normals compute *after* the transform so the GLB exporter
+        # emits the NORMAL attribute; same rationale as process_stls — without
+        # this the viewer renders flat-shaded.
+        _ = mesh.vertex_normals
+
+    # Keep the texture as-is: trimesh's GLB exporter automatically converts
+    # SimpleMaterial → PBRMaterial with `baseColorTexture` set. Don't overwrite
+    # mesh.visual — the user explicitly asked to preserve the embedded texture.
+
+    scene = trimesh.Scene()
+    scene.add_geometry(mesh, node_name=name, geom_name=name)
+    glb_bytes = scene.export(file_type="glb")
+    output_tris = len(mesh.faces)
+
+    return glb_bytes, ProcessStats(
+        total_input_triangles=input_tris,
+        total_output_triangles=output_tris,
+        glb_size_bytes=len(glb_bytes),
+        meshes=[
+            MeshStats(
+                name=name,
+                input_triangles=input_tris,
+                output_triangles=output_tris,
+                decimated=False,
+                color="",  # texture, not a flat color — main.py serializes "" → null
+            )
+        ],
+    )
+
+
+def _rewrite_mtllib(obj_bytes: bytes, new_mtl_name: str) -> bytes:
+    """Replace the `mtllib <name>` directive at the top of an OBJ.
+
+    Avoids parsing the OBJ as text — uses byte-level scan of the first ~4KB
+    where the directive always appears (the rest is megabytes of vertices).
+    """
+    head = obj_bytes[:4096]
+    tail = obj_bytes[4096:]
+    lines = head.split(b"\n")
+    for i, line in enumerate(lines):
+        if line.startswith(b"mtllib "):
+            lines[i] = f"mtllib {new_mtl_name}".encode()
+            break
+    return b"\n".join(lines) + tail

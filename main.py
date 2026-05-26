@@ -6,18 +6,25 @@ This module is pure orchestration.
 """
 from __future__ import annotations
 
+import io
 import os
 import re
 import secrets
 import unicodedata
+import zipfile
 from datetime import date
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from processor import DEFAULT_TARGET_TRIANGLES, process_stls
+from processor import DEFAULT_TARGET_TRIANGLES, process_obj_bundle, process_stls
 from r2 import R2Error, upload_glb
 from sketchfab import SketchfabError, get_status, upload_model
+
+# Accepted texture extensions inside an OBJ bundle. Most photogrammetry exports
+# use JPG (smaller); PNG is here because Three.js MTLLoader-style tools sometimes
+# emit it. Anything else is treated as junk (e.g. a stray .DS_Store inside a zip).
+_TEXTURE_EXTS = {".jpg", ".jpeg", ".png"}
 
 
 def _auto_sketchfab_name() -> str:
@@ -123,6 +130,62 @@ def health() -> dict:
     return {"ok": True, "dry_run": DRY_RUN}
 
 
+def _ext(name: str | None) -> str:
+    return os.path.splitext((name or "").lower())[1]
+
+
+def _extract_obj_bundle(
+    file_pairs: list[tuple[str, bytes]],
+) -> tuple[bytes, bytes, dict[str, bytes], str]:
+    """Pull (obj, mtl, textures, obj_name) out of a list of uploaded files.
+
+    Accepts either a single .zip containing the bundle or the loose files
+    themselves. Validates that exactly one OBJ + one MTL + ≥1 texture image
+    are present and raises HTTPException with pt-BR messages on any mismatch.
+    """
+    # If a zip was uploaded, expand it in-memory and recurse with the contents.
+    # We unwrap at most one level — a zip-of-zips is weird and rejected.
+    zip_pairs = [(n, b) for n, b in file_pairs if _ext(n) == ".zip"]
+    if zip_pairs:
+        if len(zip_pairs) > 1 or len(file_pairs) > 1:
+            raise HTTPException(
+                400,
+                "Envie um único arquivo .zip ou os arquivos do modelo soltos — não os dois.",
+            )
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_pairs[0][1])) as zf:
+                file_pairs = [
+                    (os.path.basename(zi.filename), zf.read(zi))
+                    for zi in zf.infolist()
+                    if not zi.is_dir() and not zi.filename.startswith("__MACOSX/")
+                    and os.path.basename(zi.filename)
+                ]
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "Arquivo .zip inválido ou corrompido.")
+
+    objs = [(n, b) for n, b in file_pairs if _ext(n) == ".obj"]
+    mtls = [(n, b) for n, b in file_pairs if _ext(n) == ".mtl"]
+    textures = {n: b for n, b in file_pairs if _ext(n) in _TEXTURE_EXTS}
+
+    if len(objs) != 1:
+        raise HTTPException(
+            400,
+            f"Bundle OBJ deve conter exatamente um arquivo .obj (encontrados: {len(objs)}).",
+        )
+    if len(mtls) != 1:
+        raise HTTPException(
+            400,
+            f"Bundle OBJ deve conter exatamente um arquivo .mtl (encontrados: {len(mtls)}).",
+        )
+    if not textures:
+        raise HTTPException(
+            400,
+            "Bundle OBJ precisa de ao menos uma imagem de textura (.jpg ou .png).",
+        )
+
+    return objs[0][1], mtls[0][1], textures, objs[0][0]
+
+
 @app.post("/upload")
 async def upload(
     files: list[UploadFile] = File(...),
@@ -131,7 +194,7 @@ async def upload(
     if not files:
         raise HTTPException(400, "Nenhum arquivo enviado.")
 
-    payloads: list[bytes] = []
+    file_pairs: list[tuple[str, bytes]] = []
     total_size = 0
     for f in files:
         contents = await f.read()
@@ -143,15 +206,45 @@ async def upload(
                 413,
                 f"Soma dos arquivos ultrapassa {MAX_TOTAL_BYTES // (1024 * 1024)}MB.",
             )
-        payloads.append(contents)
+        file_pairs.append((f.filename or "", contents))
 
-    mesh_names = clean_mesh_names([f.filename for f in files])
-    stls = list(zip(mesh_names, payloads))
+    # Sniff input shape: all STL vs OBJ bundle (zip or loose). Reject mixed —
+    # the colour-by-keyword path (STL) and the preserve-texture path (OBJ) are
+    # fundamentally different and combining them produces a confusing result.
+    exts = {_ext(n) for n, _ in file_pairs}
+    is_obj_bundle = ".obj" in exts or ".zip" in exts
+    is_stl_only = exts == {".stl"}
 
-    try:
-        glb_bytes, stats = process_stls(stls, target_triangles_per_mesh=target_triangles)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    if is_obj_bundle and ".stl" in exts:
+        raise HTTPException(
+            400,
+            "Envie apenas arquivos STL ou um único bundle OBJ — não misturados.",
+        )
+
+    if is_obj_bundle:
+        obj_bytes, mtl_bytes, textures, obj_filename = _extract_obj_bundle(file_pairs)
+        mesh_name = clean_mesh_names([obj_filename])[0]
+        try:
+            glb_bytes, stats = process_obj_bundle(
+                obj_bytes, mtl_bytes, textures, mesh_name
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    elif is_stl_only:
+        mesh_names = clean_mesh_names([n for n, _ in file_pairs])
+        stls = list(zip(mesh_names, [b for _, b in file_pairs]))
+        try:
+            glb_bytes, stats = process_stls(
+                stls, target_triangles_per_mesh=target_triangles
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    else:
+        raise HTTPException(
+            400,
+            "Tipo de arquivo não reconhecido. Envie arquivos .stl ou um bundle OBJ "
+            "(.obj + .mtl + imagem, soltos ou em .zip).",
+        )
 
     sketchfab_name = _auto_sketchfab_name()
 
@@ -191,7 +284,7 @@ async def upload(
                     "input_triangles": m.input_triangles,
                     "output_triangles": m.output_triangles,
                     "decimated": m.decimated,
-                    "color": m.color,
+                    "color": m.color or None,
                 }
                 for m in stats.meshes
             ],
