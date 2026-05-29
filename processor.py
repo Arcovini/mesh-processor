@@ -37,9 +37,19 @@ COLORS_BY_KEYWORD: dict[str, str] = {
     "rim": "#BA5531",     # rim: marrom-alaranjado
     "lesao": "#08E700",   # lesão: verde brilhante
     "tumor": "#08E700",   # tumor: mesmo verde da lesão (compartilha bucket → varia HSV)
-    "pele": "#C4908E",    # pele: rosado
+    "pele": "#FFD09C",    # pele: tom de pele claro
     "cortex": "#966830",  # córtex: marrom
 }
+
+# Structures whose name contains "metal" (implants, screws, plates, stents) get
+# a polished silver/titanium PBR finish instead of a flat anatomical color:
+# full metalness + low roughness so the scene's environment map reads as shiny
+# metal in the viewer. The base hex still flows through the duplicate-bucket /
+# HSV logic, so two distinct metal parts in one case stay distinguishable.
+METAL_KEYWORD = "metal"
+METAL_COLOR = "#C0C4C8"   # neutral steel/titanium gray
+METAL_METALLIC = 1.0
+METAL_ROUGHNESS = 0.25
 
 # IBM Colorblind Safe palette (minus the orange, which overlaps kidney brown).
 # Used for structures whose names don't match any keyword above.
@@ -168,8 +178,11 @@ def process_stls(
         # includes the NORMAL attribute; without it the viewer renders flat-shaded.
         _ = mesh.vertex_normals
 
-        matched_by_keyword = any(k in name.lower() for k in COLORS_BY_KEYWORD)
-        base_hex = _pick_color(name, fallback_idx)
+        is_metal = METAL_KEYWORD in name.lower()
+        # `metal` counts as a keyword match (so it doesn't consume/shift a
+        # fallback slot) but uses a fixed silver base instead of an anatomical color.
+        matched_by_keyword = is_metal or any(k in name.lower() for k in COLORS_BY_KEYWORD)
+        base_hex = METAL_COLOR if is_metal else _pick_color(name, fallback_idx)
         if not matched_by_keyword:
             fallback_idx += 1
 
@@ -177,13 +190,18 @@ def process_stls(
         bucket_counts[base_hex] = within + 1
         color_hex = _vary_hsv(base_hex, within)
 
+        # `metal` structures get a polished metallic finish; everything else
+        # stays flat anatomical (metallic 0, roughness 0.5).
+        metallic = METAL_METALLIC if is_metal else 0.0
+        roughness = METAL_ROUGHNESS if is_metal else 0.5
+
         r, g, b = _hex_to_rgb01(color_hex)
         mesh.visual = TextureVisuals(
             material=PBRMaterial(
                 name=name,
                 baseColorFactor=[r, g, b, 1.0],
-                metallicFactor=0.0,
-                roughnessFactor=0.5,
+                metallicFactor=metallic,
+                roughnessFactor=roughness,
             )
         )
 

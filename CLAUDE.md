@@ -115,12 +115,14 @@ These defaults exist because this is **medical/surgical data**, not generic 3D c
 | `rim` | `#BA5531` | rim (brown-orange) |
 | `lesao` | `#08E700` | lesão (bright green) |
 | `tumor` | `#08E700` | tumor (same green as lesão — shares bucket, see below) |
-| `pele` | `#C4908E` | pele (skin pink) |
+| `pele` | `#FFD09C` | pele (skin tone) |
 | `cortex` | `#966830` | córtex (brown) |
 
 Non-matched names cycle through an IBM Colorblind Safe palette (`FALLBACK_COLORS`) by index — deterministic, so the same name consistently gets the same color. To add/change a clinical category, edit `COLORS_BY_KEYWORD`; don't touch the fallback palette lightly — reordering it reshuffles colors for unmatched cases.
 
 **Duplicates share a "color bucket" and get HSV-varied.** When two or more meshes resolve to the same base hex (two `art`-prefixed structures, or `lesao` + `tumor` in the same case, or fallback palette wrapping past index 4), `_vary_hsv` walks each duplicate through progressively darker V with alternating S offsets. The first occurrence keeps the base color; subsequent ones stay visually distinguishable in the viewer's toggle list without losing the clinical meaning of the hue. Bucketing is per-hex, not per-keyword, which is why `tumor` mapping to the same green as `lesao` works correctly out of the box.
+
+**Metal finish (special case).** A structure whose name contains `metal` (implant, screw, plate, stent) is the one case where the PBR *finish* changes, not just the color: it gets `metallicFactor=1.0` + low `roughnessFactor` (see `METAL_*` constants in `processor.py`) and a neutral steel/titanium base hex, so the viewer's environment map renders it as polished metal. Every other structure keeps the fixed `metallic=0 / roughness=0.5`. `metal` counts as a keyword match (no fallback slot consumed) and its base hex still flows through the duplicate-bucket / HSV logic, so two distinct metal parts in one case stay distinguishable.
 
 ### Required: force vertex-normal compute after transforms
 
