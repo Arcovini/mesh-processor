@@ -7,24 +7,28 @@ STL as a named mesh node with its own PBR material (so the viewer's opacity
 slider — which acts on materials — works per-structure). Coordinates are
 rotated from RAS (Z-up, medical convention) to glTF (Y-up).
 
-Also exposes `process_obj_bundle` for OBJ + MTL + texture image uploads
-(photogrammetry-style scans). That path skips decimation (decimation would
-break UV mapping), skips the keyword color logic (the user wants the original
-texture), and scales meters → millimeters (KIRI-style scanners output meters
-while the viewer assumes 1 unit = 1 mm everywhere).
+Also exposes `process_obj_bundle` for OBJ uploads (single- or multi-object, with
+an optional MTL + texture images). Coloring is material-aware, decided per object:
+a textured object keeps its texture; an object with a flat MTL color keeps that
+color; an object with no material at all falls through to the same keyword/palette
+logic used for STL (one source of color config, in this module). That path skips
+decimation (would break UV mapping) and scales meters → millimeters only when the
+model looks like it's in meters (photogrammetry), leaving mm-authored OBJs alone.
 """
 from __future__ import annotations
 
 import colorsys
 import io
 import os
+import re
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 
 import fast_simplification
 import numpy as np
 import trimesh
-from trimesh.visual import TextureVisuals
+from trimesh.visual import ColorVisuals, TextureVisuals
 from trimesh.visual.material import PBRMaterial
 
 DEFAULT_TARGET_TRIANGLES = 300_000
@@ -116,6 +120,39 @@ def _vary_hsv(hex_color: str, index: int) -> str:
     return f"#{int(round(r * 255)):02X}{int(round(g * 255)):02X}{int(round(b * 255)):02X}"
 
 
+def _name_based_material(
+    name: str, bucket_counts: dict[str, int], fallback_idx: int
+) -> tuple[str, PBRMaterial, int]:
+    """Color + PBR finish for a mesh that has no material of its own, from its name.
+
+    Single source of name-based coloring for BOTH STL meshes and material-less OBJ
+    objects: `metal` → polished silver/titanium (full metalness, low roughness);
+    other keyword → palette color; unmatched → cycling fallback palette. Duplicates
+    of a base hex are HSV-varied via `bucket_counts` so they stay distinguishable.
+
+    Returns (color_hex, material, next_fallback_idx).
+    """
+    lower = name.lower()
+    is_metal = METAL_KEYWORD in lower
+    # `metal` counts as a keyword match (so it doesn't consume/shift a fallback
+    # slot) but uses a fixed silver base instead of an anatomical color.
+    matched = is_metal or any(k in lower for k in COLORS_BY_KEYWORD)
+    base_hex = METAL_COLOR if is_metal else _pick_color(name, fallback_idx)
+    if not matched:
+        fallback_idx += 1
+    within = bucket_counts.get(base_hex, 0)
+    bucket_counts[base_hex] = within + 1
+    color_hex = _vary_hsv(base_hex, within)
+    r, g, b = _hex_to_rgb01(color_hex)
+    material = PBRMaterial(
+        name=name,
+        baseColorFactor=[r, g, b, 1.0],
+        metallicFactor=METAL_METALLIC if is_metal else 0.0,
+        roughnessFactor=METAL_ROUGHNESS if is_metal else 0.5,
+    )
+    return color_hex, material, fallback_idx
+
+
 def _load_and_decimate(
     stl_bytes: bytes, target_triangles: int
 ) -> tuple[trimesh.Trimesh, int, bool]:
@@ -178,32 +215,10 @@ def process_stls(
         # includes the NORMAL attribute; without it the viewer renders flat-shaded.
         _ = mesh.vertex_normals
 
-        is_metal = METAL_KEYWORD in name.lower()
-        # `metal` counts as a keyword match (so it doesn't consume/shift a
-        # fallback slot) but uses a fixed silver base instead of an anatomical color.
-        matched_by_keyword = is_metal or any(k in name.lower() for k in COLORS_BY_KEYWORD)
-        base_hex = METAL_COLOR if is_metal else _pick_color(name, fallback_idx)
-        if not matched_by_keyword:
-            fallback_idx += 1
-
-        within = bucket_counts.get(base_hex, 0)
-        bucket_counts[base_hex] = within + 1
-        color_hex = _vary_hsv(base_hex, within)
-
-        # `metal` structures get a polished metallic finish; everything else
-        # stays flat anatomical (metallic 0, roughness 0.5).
-        metallic = METAL_METALLIC if is_metal else 0.0
-        roughness = METAL_ROUGHNESS if is_metal else 0.5
-
-        r, g, b = _hex_to_rgb01(color_hex)
-        mesh.visual = TextureVisuals(
-            material=PBRMaterial(
-                name=name,
-                baseColorFactor=[r, g, b, 1.0],
-                metallicFactor=metallic,
-                roughnessFactor=roughness,
-            )
+        color_hex, material, fallback_idx = _name_based_material(
+            name, bucket_counts, fallback_idx
         )
+        mesh.visual = TextureVisuals(material=material)
 
         scene.add_geometry(mesh, node_name=name, geom_name=name)
         output_tris = len(mesh.faces)
@@ -231,46 +246,109 @@ def process_stls(
 
 # KIRI Engine and most photogrammetry exporters use meters. The viewer assumes
 # 1 unit = 1 mm (measurement.js treats distanceTo() as mm directly, ar.js bakes
-# a 0.001 scale into the USDZ). Multiply OBJ vertices by 1000 so a 0.7m skull
+# a 0.001 scale into the USDZ). Multiply such OBJ vertices by 1000 so a 0.7m skull
 # scan ends up at 700mm — measurable in the same units as the medical STLs.
 _OBJ_METERS_TO_MM = 1000.0
+
+# Below this max bounding-box extent we assume the OBJ is in meters (photogrammetry)
+# and scale ×1000; above it we assume millimetres (a medically-authored OBJ) and
+# leave it alone. 10 units is a safe gap: meter-scale scans sit under ~2, while
+# anatomy in mm sits well above tens. Avoids 1000×-blowing-up an mm-authored OBJ.
+_OBJ_UNIT_METERS_THRESHOLD = 10.0
+
+# trimesh's SimpleMaterial default diffuse — a mesh carrying exactly this (and no
+# texture) had no real material, so we treat it as "uncoloured" → keyword palette.
+_TRIMESH_DEFAULT_DIFFUSE = (102, 102, 102)
+
+# Keep objects separate (one geometry per `o`, keyed by object name) AND keep each
+# object's own material — without merging by material or concatenating into one mesh.
+_OBJ_LOAD_OPTS = dict(process=False, split_object=True, group_material=False)
+
+
+def _clean_part_name(raw: str) -> str:
+    """Transliterate accents + strip separators off an OBJ object name."""
+    s = "".join(
+        c for c in unicodedata.normalize("NFKD", raw or "") if not unicodedata.combining(c)
+    )
+    return s.strip(" _/") or "mesh"
+
+
+def _part_material_kind(visual) -> tuple[str, object]:
+    """Classify a loaded object's visual: ('texture'|'color'|'none', material)."""
+    mat = getattr(visual, "material", None)
+    if mat is None or isinstance(visual, ColorVisuals):
+        return "none", None
+    if getattr(mat, "image", None) is not None:
+        return "texture", mat
+    diffuse = getattr(mat, "diffuse", None)
+    if diffuse is not None:
+        if tuple(int(c) for c in diffuse[:3]) == _TRIMESH_DEFAULT_DIFFUSE:
+            return "none", None   # trimesh default sentinel = effectively uncoloured
+        return "color", mat
+    if getattr(mat, "baseColorFactor", None) is not None:
+        return "color", mat
+    return "none", None
+
+
+def _flat_material_rgb01(mat) -> tuple[float, float, float]:
+    """Flat colour of a material as 0..1 RGB (from MTL Kd / baseColorFactor)."""
+    diffuse = getattr(mat, "diffuse", None)
+    if diffuse is not None:
+        return (int(diffuse[0]) / 255.0, int(diffuse[1]) / 255.0, int(diffuse[2]) / 255.0)
+    bcf = mat.baseColorFactor
+    return (float(bcf[0]), float(bcf[1]), float(bcf[2]))
+
+
+def _rgb01_to_hex(rgb01: tuple[float, float, float]) -> str:
+    return "#%02X%02X%02X" % tuple(max(0, min(255, round(c * 255))) for c in rgb01)
+
+
+def _flat_pbr_material(name: str, rgb01: tuple[float, float, float]) -> PBRMaterial:
+    """A dielectric PBR material with the given colour — same finish as the STL path."""
+    return PBRMaterial(
+        name=name,
+        baseColorFactor=[rgb01[0], rgb01[1], rgb01[2], 1.0],
+        metallicFactor=0.0,
+        roughnessFactor=0.5,
+    )
 
 
 def process_obj_bundle(
     obj_bytes: bytes,
-    mtl_bytes: bytes,
+    mtl_bytes: bytes | None,
     textures: dict[str, bytes],
     name: str,
 ) -> tuple[bytes, ProcessStats]:
-    """Build a GLB from an OBJ + MTL + texture image bundle.
+    """Build a GLB from an OBJ upload (single- or multi-object), colour per object.
 
-    `textures` maps image filename (as referenced in the MTL's `map_Kd`, etc.)
-    to bytes. trimesh resolves these via the filesystem, so we materialize the
-    bundle in a temp dir, load by path, then drop the temp dir.
-
-    No decimation (would break UVs). No color override (preserve the texture).
-    No RAS→Y-up rotation (OBJ photogrammetry is already Y-up).
+    `mtl_bytes` is optional; `textures` maps image filename (as referenced in the
+    MTL's `map_Kd`) to bytes. The bundle is materialized in a temp dir so trimesh
+    can resolve the MTL/images by path. Per object: texture → kept; flat MTL colour
+    → kept; nothing → keyword/palette colour (same source as STL). No decimation
+    (would break UVs). No RAS→Y-up rotation (OBJ is already Y-up).
     """
     if not obj_bytes:
         raise ValueError("Arquivo OBJ vazio.")
-    if not mtl_bytes:
-        raise ValueError("Arquivo MTL ausente — necessário para a textura.")
-    if not textures:
-        raise ValueError("Imagem(s) de textura ausente(s).")
+
+    # Did the MTL ask for a texture? If so and none loads, that's the Pillow-missing
+    # silent-texture-loss bug — fail loudly. (Without a map_Kd, "no image" is valid.)
+    mtl_has_map_kd = bool(mtl_bytes) and re.search(rb"(?mi)^\s*map_Kd\b", mtl_bytes) is not None
 
     with tempfile.TemporaryDirectory() as tmpdir:
         obj_path = os.path.join(tmpdir, "model.obj")
-        # The OBJ references its MTL by the `mtllib` directive (which is a
-        # filename, not a path). Rewriting that name to a known value lets us
-        # control the layout without parsing the OBJ.
-        rewritten_obj = _rewrite_mtllib(obj_bytes, "model.mtl")
+        if mtl_bytes:
+            # The OBJ references its MTL by the `mtllib` directive (a filename, not
+            # a path). Rewrite it to a known value to control the temp-dir layout.
+            rewritten_obj = _rewrite_mtllib(obj_bytes, "model.mtl")
+            with open(os.path.join(tmpdir, "model.mtl"), "wb") as f:
+                f.write(mtl_bytes)
+        else:
+            rewritten_obj = obj_bytes
         with open(obj_path, "wb") as f:
             f.write(rewritten_obj)
-        with open(os.path.join(tmpdir, "model.mtl"), "wb") as f:
-            f.write(mtl_bytes)
         for tex_name, tex_data in textures.items():
-            # Sanitize: only the basename matters for trimesh's resolver, and
-            # we don't want a malicious bundle to write outside tmpdir.
+            # Sanitize: only the basename matters for trimesh's resolver, and we
+            # don't want a malicious bundle to write outside tmpdir.
             safe = os.path.basename(tex_name)
             if not safe:
                 continue
@@ -278,77 +356,96 @@ def process_obj_bundle(
                 f.write(tex_data)
 
         try:
-            loaded = trimesh.load(obj_path, process=True)
+            loaded = trimesh.load(obj_path, **_OBJ_LOAD_OPTS)
         except Exception as e:
             raise ValueError(f"OBJ inválido ou corrompido: {e}") from e
 
-        # OBJ can be one Trimesh (single `o`) or a Scene (multiple `o` directives).
-        # Multi-`o` with distinct materials would lose textures on concatenation,
-        # so we reject it in v1 — KIRI and similar tools always export a single
-        # object so this is a clear "you uploaded the wrong thing" signal.
+        # Normalize to [(part_name, Trimesh)]. Multi-object OBJ → Scene keyed by the
+        # `o` names; single object → a bare Trimesh that takes the upload filename.
         if isinstance(loaded, trimesh.Scene):
-            parts = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+            parts = [
+                (k, g) for k, g in loaded.geometry.items() if isinstance(g, trimesh.Trimesh)
+            ]
             if not parts:
                 raise ValueError("OBJ não contém nenhuma malha utilizável.")
-            if len(parts) > 1:
-                raise ValueError(
-                    "OBJ com múltiplos objetos não suportado — envie um único modelo."
-                )
-            mesh = parts[0]
+            if len(parts) == 1:
+                parts = [(name, parts[0][1])]
+        elif isinstance(loaded, trimesh.Trimesh):
+            parts = [(name, loaded)]
         else:
-            mesh = loaded
+            raise ValueError("Arquivo OBJ não pôde ser carregado como malha.")
 
-        if not isinstance(mesh, trimesh.Trimesh):
-            raise ValueError("Arquivo OBJ não pôde ser carregado como uma única malha.")
+        # Unit heuristic over the whole model, so every part gets the SAME scale and
+        # stays aligned. Meters (small) → ×1000; mm (large) → untouched.
+        lo = np.min([g.bounds[0] for _, g in parts], axis=0)
+        hi = np.max([g.bounds[1] for _, g in parts], axis=0)
+        max_extent = float(np.max(hi - lo))
+        scale = _OBJ_METERS_TO_MM if 0 < max_extent < _OBJ_UNIT_METERS_THRESHOLD else 1.0
 
-        input_tris = len(mesh.faces)
+        scene = trimesh.Scene()
+        mesh_stats: list[MeshStats] = []
+        bucket_counts: dict[str, int] = {}
+        fallback_idx = 0
+        used_names: set[str] = set()
+        any_texture = False
 
-        # Guard against silent texture loss. trimesh's OBJ loader treats Pillow
-        # as an optional dependency: without it (or if the MTL image resolution
-        # fails for any other reason), the load succeeds but `material.image`
-        # is None, and the GLB exporter drops the baseColorTexture without a
-        # single warning. The viewer then renders monochrome and the regression
-        # only shows up in the browser. Failing loudly here pushes the bug to
-        # the upload response where it's debuggable.
-        image = getattr(mesh.visual.material, "image", None) if hasattr(mesh.visual, "material") else None
-        if image is None:
+        for raw_name, mesh in parts:
+            if scale != 1.0:
+                mesh.apply_scale(scale)
+            # Force vertex_normals after the scale so the GLB exporter emits NORMAL.
+            _ = mesh.vertex_normals
+
+            part_name = _clean_part_name(raw_name)
+            unique = part_name
+            suffix = 2
+            while unique in used_names:
+                unique = f"{part_name}_{suffix}"
+                suffix += 1
+            part_name = unique
+            used_names.add(part_name)
+
+            kind, mat = _part_material_kind(mesh.visual)
+            if kind == "texture":
+                any_texture = True
+                color_hex = ""   # the texture carries the look → null swatch in viewer
+            elif kind == "color":
+                rgb01 = _flat_material_rgb01(mat)
+                color_hex = _rgb01_to_hex(rgb01)
+                mesh.visual = TextureVisuals(material=_flat_pbr_material(part_name, rgb01))
+            else:  # 'none' → same name-based color + finish as STL (incl. metal)
+                color_hex, material, fallback_idx = _name_based_material(
+                    part_name, bucket_counts, fallback_idx
+                )
+                mesh.visual = TextureVisuals(material=material)
+
+            scene.add_geometry(mesh, node_name=part_name, geom_name=part_name)
+            tris = len(mesh.faces)
+            mesh_stats.append(
+                MeshStats(
+                    name=part_name,
+                    input_triangles=tris,
+                    output_triangles=tris,
+                    decimated=False,
+                    color=color_hex,
+                )
+            )
+
+        # Silent-texture-loss guard (Pillow missing / unresolved image): the MTL
+        # asked for a texture but none came through.
+        if mtl_has_map_kd and not any_texture:
             raise ValueError(
                 "Textura do OBJ não pôde ser carregada — verifique se o MTL referencia "
                 "uma imagem (.jpg/.png) e se ela foi enviada junto."
             )
 
-        # Meters → millimeters. Applied via a uniform scale matrix so UVs and
-        # the TextureVisuals stay intact (a direct vertex multiply would also
-        # work but applying as a transform is the idiomatic trimesh way and
-        # keeps any future per-mesh transforms composable).
-        mesh.apply_scale(_OBJ_METERS_TO_MM)
-        # Force vertex_normals compute *after* the transform so the GLB exporter
-        # emits the NORMAL attribute; same rationale as process_stls — without
-        # this the viewer renders flat-shaded.
-        _ = mesh.vertex_normals
-
-    # Keep the texture as-is: trimesh's GLB exporter automatically converts
-    # SimpleMaterial → PBRMaterial with `baseColorTexture` set. Don't overwrite
-    # mesh.visual — the user explicitly asked to preserve the embedded texture.
-
-    scene = trimesh.Scene()
-    scene.add_geometry(mesh, node_name=name, geom_name=name)
     glb_bytes = scene.export(file_type="glb")
-    output_tris = len(mesh.faces)
+    total_tris = sum(m.input_triangles for m in mesh_stats)
 
     return glb_bytes, ProcessStats(
-        total_input_triangles=input_tris,
-        total_output_triangles=output_tris,
+        total_input_triangles=total_tris,
+        total_output_triangles=total_tris,
         glb_size_bytes=len(glb_bytes),
-        meshes=[
-            MeshStats(
-                name=name,
-                input_triangles=input_tris,
-                output_triangles=output_tris,
-                decimated=False,
-                color="",  # texture, not a flat color — main.py serializes "" → null
-            )
-        ],
+        meshes=mesh_stats,
     )
 
 

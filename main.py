@@ -136,12 +136,14 @@ def _ext(name: str | None) -> str:
 
 def _extract_obj_bundle(
     file_pairs: list[tuple[str, bytes]],
-) -> tuple[bytes, bytes, dict[str, bytes], str]:
-    """Pull (obj, mtl, textures, obj_name) out of a list of uploaded files.
+) -> tuple[bytes, bytes | None, dict[str, bytes], str]:
+    """Pull (obj, mtl_or_None, textures, obj_name) out of a list of uploaded files.
 
     Accepts either a single .zip containing the bundle or the loose files
-    themselves. Validates that exactly one OBJ + one MTL + ≥1 texture image
-    are present and raises HTTPException with pt-BR messages on any mismatch.
+    themselves. Requires exactly one OBJ; the MTL and texture images are
+    optional (an OBJ without a material falls through to keyword colouring in
+    processor.process_obj_bundle). Raises HTTPException with pt-BR messages on
+    any mismatch.
     """
     # If a zip was uploaded, expand it in-memory and recurse with the contents.
     # We unwrap at most one level — a zip-of-zips is weird and rejected.
@@ -172,18 +174,14 @@ def _extract_obj_bundle(
             400,
             f"Bundle OBJ deve conter exatamente um arquivo .obj (encontrados: {len(objs)}).",
         )
-    if len(mtls) != 1:
+    if len(mtls) > 1:
         raise HTTPException(
             400,
-            f"Bundle OBJ deve conter exatamente um arquivo .mtl (encontrados: {len(mtls)}).",
-        )
-    if not textures:
-        raise HTTPException(
-            400,
-            "Bundle OBJ precisa de ao menos uma imagem de textura (.jpg ou .png).",
+            f"Bundle OBJ deve conter no máximo um arquivo .mtl (encontrados: {len(mtls)}).",
         )
 
-    return objs[0][1], mtls[0][1], textures, objs[0][0]
+    mtl_bytes = mtls[0][1] if mtls else None
+    return objs[0][1], mtl_bytes, textures, objs[0][0]
 
 
 @app.post("/upload")
