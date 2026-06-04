@@ -95,7 +95,7 @@ def test_object_without_material_falls_back_to_keyword_skin():
     glb, stats = process_obj_bundle(a.encode(), None, {}, "pele_perna")  # filename drives it
     names = _by_name(stats)
     assert "pele_perna" in names
-    assert names["pele_perna"].color.upper() == "#FFD09C"  # COLORS_BY_KEYWORD["pele"]
+    assert names["pele_perna"].color.upper() == "#DC8576"  # COLORS_BY_KEYWORD["pele"]
 
 
 def test_mixed_some_with_material_some_without():
@@ -107,7 +107,7 @@ def test_mixed_some_with_material_some_without():
     obj = "mtllib model.mtl\n" + a + b
     glb, stats = process_obj_bundle(obj.encode(), mtl.encode(), {}, "modelo")
     names = _by_name(stats)
-    assert names["pele"].color.upper() == "#FFD09C"      # keyword skin
+    assert names["pele"].color.upper() == "#DC8576"      # keyword skin
     assert names["vaso"].color.upper() == "#CC1A1A"      # preserved Kd
 
 
@@ -155,7 +155,14 @@ def test_stl_path_unchanged_keyword_color():
     """STL has no material → keyword palette, exactly as before."""
     stl_bytes = trimesh.creation.box(extents=(50, 50, 50)).export(file_type="stl")
     _, stats = process_stls([("pele", stl_bytes)])
-    assert stats.meshes[0].color.upper() == "#FFD09C"
+    assert stats.meshes[0].color.upper() == "#DC8576"
+
+
+def test_stl_bone_keyword_offwhite():
+    """STL named '*osso*' → off-white bone tone (keyword palette)."""
+    stl_bytes = trimesh.creation.box(extents=(50, 50, 50)).export(file_type="stl")
+    _, stats = process_stls([("osso_cortical", stl_bytes)])
+    assert stats.meshes[0].color.upper() == "#EAE3D2"
 
 
 def test_stl_metal_name_gets_metallic_finish():

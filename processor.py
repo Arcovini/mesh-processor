@@ -41,8 +41,9 @@ COLORS_BY_KEYWORD: dict[str, str] = {
     "rim": "#BA5531",     # rim: marrom-alaranjado
     "lesao": "#08E700",   # lesão: verde brilhante
     "tumor": "#08E700",   # tumor: mesmo verde da lesão (compartilha bucket → varia HSV)
-    "pele": "#FFD09C",    # pele: tom de pele claro
+    "pele": "#DC8576",    # pele: rosado avermelhado
     "cortex": "#966830",  # córtex: marrom
+    "osso": "#EAE3D2",    # osso: marfim / off-white (mais claro que a pele)
 }
 
 # Structures whose name contains "metal" (implants, screws, plates, stents) get
