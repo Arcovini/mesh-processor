@@ -165,6 +165,63 @@ def test_stl_bone_keyword_offwhite():
     assert stats.meshes[0].color.upper() == "#EAE3D2"
 
 
+def _box_stl():
+    return trimesh.creation.box(extents=(50, 50, 50)).export(file_type="stl")
+
+
+def test_stl_kidney_keyword_matches_rim_brown():
+    """STL named '*kidney*' → mesmo marrom de '*rim*'; par esquerdo/direito varia HSV."""
+    stl_bytes = _box_stl()
+    _, stats = process_stls([("Left Kidney", stl_bytes)])
+    assert stats.meshes[0].color.upper() == "#BA5531"  # COLORS_BY_KEYWORD["rim"]
+
+    _, stats2 = process_stls([("rim_direito", stl_bytes), ("Left Kidney", stl_bytes)])
+    colors = [m.color.upper() for m in stats2.meshes]
+    assert colors[0] == "#BA5531"          # primeiro do bucket = hex base
+    assert colors[1] != colors[0]          # segundo varia (mesmo bucket que 'rim')
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Rim Direito", "Rins", "Kidney", "Kidneys", "Parenquima Renal", "Vasos Renais"],
+)
+def test_kidney_variants_all_land_on_the_same_brown(name):
+    """Todas as variações PT/EN caem no mesmo marrom base (bucket compartilhado)."""
+    _, stats = process_stls([(name, _box_stl())])
+    assert stats.meshes[0].color.upper() == "#BA5531"
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("Arteria Renal", "#BD0006"),   # 'art' vem antes → vaso, não rim
+        ("Veia Renal", "#477EFF"),      # 'vei' vem antes → vaso
+        ("Tumor Renal", "#08E700"),     # 'tumor' vem antes → verde de lesão
+        ("Lesao Renal", "#08E700"),
+        ("Cortex Renal", "#966830"),    # 'cortex' vem antes → marrom do córtex
+    ],
+)
+def test_renal_adjective_does_not_steal_more_specific_keywords(name, expected):
+    """`renal`/`renais` ficam por último: keyword mais específica vence."""
+    _, stats = process_stls([(name, _box_stl())])
+    assert stats.meshes[0].color.upper() == expected
+
+
+@pytest.mark.parametrize("name", ["Adrenal", "Glandula Suprarrenal", "Adrenais"])
+def test_adrenal_gland_is_not_painted_kidney_brown(name):
+    """Glândula adrenal contém 'renal' mas é outro órgão → veto, cai no fallback."""
+    _, stats = process_stls([(name, _box_stl())])
+    assert stats.meshes[0].color.upper() != "#BA5531"
+
+
+def test_vetoed_names_still_advance_the_fallback_palette():
+    """Veto devolve ao fallback E consome slot — duas adrenais não saem iguais."""
+    stl_bytes = _box_stl()
+    _, stats = process_stls([("Adrenal Direita", stl_bytes), ("Adrenal Esquerda", stl_bytes)])
+    colors = [m.color.upper() for m in stats.meshes]
+    assert colors[0] != colors[1]
+
+
 def test_stl_metal_name_gets_metallic_finish():
     """STL named '*metal*' → silver base + metallicFactor=1 (b400060 behavior preserved)."""
     stl_bytes = trimesh.creation.box(extents=(20, 20, 20)).export(file_type="stl")

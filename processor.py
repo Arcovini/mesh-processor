@@ -34,16 +34,35 @@ from trimesh.visual.material import PBRMaterial
 DEFAULT_TARGET_TRIANGLES = 300_000
 
 # Keyword-to-color mapping — case-insensitive substring match against mesh name.
-# Order matters only if keywords could overlap (here none do).
+# Nomes chegam transliterados (main.clean_mesh_names / _clean_part_name), então as
+# keywords são escritas sem acento.
+#
+# Primeiro match vence, então ORDEM IMPORTA onde as keywords se sobrepõem:
+# `art`/`vei` na frente fazem "arteria renal" / "veia renal" lerem como vaso, e
+# `renal`/`renais` ficam por último para não roubarem "tumor renal" (verde) nem
+# "cortex renal" (marrom do córtex).
 COLORS_BY_KEYWORD: dict[str, str] = {
     "art": "#BD0006",     # artéria: vermelho escuro
     "vei": "#477EFF",     # veia / vein: azul
     "rim": "#BA5531",     # rim: marrom-alaranjado
+    "rins": "#BA5531",    # rins: o plural não contém "rim", precisa de entrada própria
+    "kidney": "#BA5531",  # kidney(s): mesmo marrom do rim (mesmo bucket → varia HSV)
     "lesao": "#08E700",   # lesão: verde brilhante
     "tumor": "#08E700",   # tumor: mesmo verde da lesão (compartilha bucket → varia HSV)
     "pele": "#DC8576",    # pele: rosado avermelhado
     "cortex": "#966830",  # córtex: marrom
     "osso": "#EAE3D2",    # osso: marfim / off-white (mais claro que a pele)
+    "renal": "#BA5531",   # renal / renais (PT e EN): adjetivo do rim, mesmo marrom —
+    "renais": "#BA5531",  # por último de propósito (ver bloco de ordem acima)
+}
+
+# `adrenal` / `suprarrenal` contêm "renal" (e `adrenais` contém "renais"), mas a
+# glândula adrenal é outro órgão. Estes stems vetam a keyword, devolvendo a
+# estrutura à paleta de fallback em vez de pintá-la com o marrom do rim.
+_ADRENAL_STEMS = ("adren", "suprarren", "supra-ren", "supra ren")
+KEYWORD_VETOES: dict[str, tuple[str, ...]] = {
+    "renal": _ADRENAL_STEMS,
+    "renais": _ADRENAL_STEMS,
 }
 
 # Structures whose name contains "metal" (implants, screws, plates, stents) get
@@ -96,12 +115,16 @@ def _hex_to_rgb01(hex_color: str) -> tuple[float, float, float]:
     )
 
 
-def _pick_color(name: str, fallback_idx: int) -> str:
-    lower = name.lower()
+def _keyword_color(lower: str) -> str | None:
+    """Hex da primeira keyword que casa e não é vetada; None se nenhuma casar.
+
+    Fonte única do "isto casou com a paleta?" — quem chama decide o fallback, para
+    que match e consumo de slot de fallback nunca divirjam.
+    """
     for keyword, hex_color in COLORS_BY_KEYWORD.items():
-        if keyword in lower:
+        if keyword in lower and not any(v in lower for v in KEYWORD_VETOES.get(keyword, ())):
             return hex_color
-    return FALLBACK_COLORS[fallback_idx % len(FALLBACK_COLORS)]
+    return None
 
 
 def _vary_hsv(hex_color: str, index: int) -> str:
@@ -135,11 +158,15 @@ def _name_based_material(
     """
     lower = name.lower()
     is_metal = METAL_KEYWORD in lower
-    # `metal` counts as a keyword match (so it doesn't consume/shift a fallback
-    # slot) but uses a fixed silver base instead of an anatomical color.
-    matched = is_metal or any(k in lower for k in COLORS_BY_KEYWORD)
-    base_hex = METAL_COLOR if is_metal else _pick_color(name, fallback_idx)
-    if not matched:
+    keyword_hex = _keyword_color(lower)
+    if is_metal:
+        # `metal` counts as a keyword match (so it doesn't consume/shift a fallback
+        # slot) but uses a fixed silver base instead of an anatomical color.
+        base_hex = METAL_COLOR
+    elif keyword_hex is not None:
+        base_hex = keyword_hex
+    else:
+        base_hex = FALLBACK_COLORS[fallback_idx % len(FALLBACK_COLORS)]
         fallback_idx += 1
     within = bucket_counts.get(base_hex, 0)
     bucket_counts[base_hex] = within + 1
