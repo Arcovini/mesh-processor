@@ -38,17 +38,19 @@ DEFAULT_TARGET_TRIANGLES = 300_000
 # keywords são escritas sem acento.
 #
 # Primeiro match vence, então ORDEM IMPORTA onde as keywords se sobrepõem:
-# `art`/`vei` na frente fazem "arteria renal" / "veia renal" lerem como vaso, e
-# `renal`/`renais` ficam por último para não roubarem "tumor renal" (verde) nem
-# "cortex renal" (marrom do córtex).
+#  - `tumor`/`lesao` no topo — regra de produto: se tem "tumor" no nome, é verde.
+#    A lesão nunca é mascarada pelo órgão que a hospeda ("tumor de rim" é verde,
+#    não marrom de rim). Vale inclusive sobre `art`/`vei`.
+#  - `art`/`vei` em seguida: "arteria renal" / "veia renal" leem como vaso.
+#  - `renal`/`renais` por último: adjetivo genérico, não deve roubar `cortex`.
 COLORS_BY_KEYWORD: dict[str, str] = {
+    "tumor": "#08E700",   # tumor: verde brilhante
+    "lesao": "#08E700",   # lesão: mesmo verde do tumor (compartilha bucket → varia HSV)
     "art": "#BD0006",     # artéria: vermelho escuro
     "vei": "#477EFF",     # veia / vein: azul
     "rim": "#BA5531",     # rim: marrom-alaranjado
     "rins": "#BA5531",    # rins: o plural não contém "rim", precisa de entrada própria
     "kidney": "#BA5531",  # kidney(s): mesmo marrom do rim (mesmo bucket → varia HSV)
-    "lesao": "#08E700",   # lesão: verde brilhante
-    "tumor": "#08E700",   # tumor: mesmo verde da lesão (compartilha bucket → varia HSV)
     "pele": "#DC8576",    # pele: rosado avermelhado
     "cortex": "#966830",  # córtex: marrom
     "osso": "#EAE3D2",    # osso: marfim / off-white (mais claro que a pele)

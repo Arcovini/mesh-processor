@@ -207,6 +207,33 @@ def test_renal_adjective_does_not_steal_more_specific_keywords(name, expected):
     assert stats.meshes[0].color.upper() == expected
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Tumor",
+        "Tumor de Rim",       # 'rim' casaria antes se `tumor` não estivesse no topo
+        "Kidney Tumor",
+        "Tumor Renal",
+        "Tumor no Osso",
+        "Tumor de Pele",
+        "Lesao de Rim",
+        "Lesao Renal",
+    ],
+)
+def test_tumor_always_wins_over_the_host_organ(name):
+    """Regra de produto: nome com 'tumor' (ou 'lesao') é sempre verde."""
+    _, stats = process_stls([(name, _box_stl())])
+    assert stats.meshes[0].color.upper() == "#08E700"
+
+
+def test_tumor_outranks_vessel_keywords_too():
+    """Consequência deliberada de "tumor ⇒ verde": vale até sobre 'art'/'vei'."""
+    stl_bytes = _box_stl()
+    _, stats = process_stls([("Arteria do Tumor", stl_bytes), ("Veia do Tumor", stl_bytes)])
+    assert [m.color.upper() for m in stats.meshes][0] == "#08E700"
+    assert all(m.color.upper() != "#BD0006" for m in stats.meshes)
+
+
 @pytest.mark.parametrize("name", ["Adrenal", "Glandula Suprarrenal", "Adrenais"])
 def test_adrenal_gland_is_not_painted_kidney_brown(name):
     """Glândula adrenal contém 'renal' mas é outro órgão → veto, cai no fallback."""
