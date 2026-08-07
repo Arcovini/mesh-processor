@@ -34,19 +34,20 @@ def _auto_sketchfab_name() -> str:
 
 MAX_TOTAL_BYTES = 60 * 1024 * 1024  # 60 MB across all files in one request
 
-# Teto defensivo de interações booleanas por caso — um caso clínico real tem
-# poucas; dezenas indicam configuração errada (e booleana tem custo de CPU).
+# Teto defensivo de divisões (dentro/fora) por caso — um caso clínico real tem
+# poucas; dezenas indicam configuração errada (e a operação tem custo de CPU).
 MAX_BOOLEAN_OPS = 20
 
 
 def _parse_boolean_ops(raw: str, filenames: list[str]) -> list[tuple[int, int]]:
-    """Valida o form field `boolean_ops` → lista de (idx principal, idx secundária).
+    """Valida o form field `boolean_ops` → lista de (idx referência, idx a dividir).
 
     O campo é um JSON `[{"principal": "<filename>", "secondary": "<filename>"}]`
-    com os filenames originais do mesmo request; devolvemos índices em
-    `filenames` para o caller mapear aos nomes limpos. Campo vazio → sem ops.
-    Erros são HTTPException 400 com mensagem pt-BR (aparecem direto na tela do
-    clínico).
+    com os filenames originais do mesmo request (nomes de campo são contrato de
+    API; na UI eles aparecem como "referência" e "a dividir"); devolvemos
+    índices em `filenames` para o caller mapear aos nomes limpos. Campo vazio →
+    sem divisões. Erros são HTTPException 400 com mensagem pt-BR (aparecem
+    direto na tela do clínico).
     """
     if not raw or not raw.strip():
         return []
@@ -54,15 +55,15 @@ def _parse_boolean_ops(raw: str, filenames: list[str]) -> list[tuple[int, int]]:
         data = json.loads(raw)
     except json.JSONDecodeError:
         raise HTTPException(
-            400, "Configuração de interações booleanas inválida (JSON malformado)."
+            400, "Configuração de divisão de estruturas inválida (JSON malformado)."
         )
     if not isinstance(data, list):
         raise HTTPException(
-            400, "Configuração de interações booleanas inválida (esperada uma lista)."
+            400, "Configuração de divisão de estruturas inválida (esperada uma lista)."
         )
     if len(data) > MAX_BOOLEAN_OPS:
         raise HTTPException(
-            400, f"No máximo {MAX_BOOLEAN_OPS} interações booleanas por caso."
+            400, f"No máximo {MAX_BOOLEAN_OPS} divisões de estruturas por caso."
         )
 
     pairs: list[tuple[int, int]] = []
@@ -71,7 +72,7 @@ def _parse_boolean_ops(raw: str, filenames: list[str]) -> list[tuple[int, int]]:
         if not isinstance(item, dict):
             raise HTTPException(
                 400,
-                "Cada interação booleana precisa dos campos 'principal' e 'secondary'.",
+                "Cada divisão precisa dos campos 'principal' e 'secondary'.",
             )
         indices = []
         for key in ("principal", "secondary"):
@@ -79,16 +80,16 @@ def _parse_boolean_ops(raw: str, filenames: list[str]) -> list[tuple[int, int]]:
             if value not in filenames:
                 raise HTTPException(
                     400,
-                    f"Interação booleana referencia um arquivo não enviado: {value!r}.",
+                    f"A divisão referencia um arquivo não enviado: {value!r}.",
                 )
             indices.append(filenames.index(value))
         principal_idx, secondary_idx = indices
         if principal_idx == secondary_idx:
             raise HTTPException(
-                400, "Uma interação booleana precisa de duas estruturas diferentes."
+                400, "Uma divisão precisa de duas estruturas diferentes."
             )
         if (principal_idx, secondary_idx) in seen:
-            raise HTTPException(400, "Interação booleana duplicada — remova a repetição.")
+            raise HTTPException(400, "Divisão repetida: remova a repetição.")
         seen.add((principal_idx, secondary_idx))
         pairs.append((principal_idx, secondary_idx))
     return pairs
@@ -284,7 +285,7 @@ async def upload(
     if ops_idx and not is_stl_only:
         raise HTTPException(
             400,
-            "Interações booleanas estão disponíveis apenas para envios de arquivos STL.",
+            "A divisão de estruturas está disponível apenas para envios de arquivos STL.",
         )
 
     if is_obj_bundle:

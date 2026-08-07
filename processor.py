@@ -38,16 +38,18 @@ DEFAULT_TARGET_TRIANGLES = 300_000
 # keywords são escritas sem acento.
 #
 # Primeiro match vence, então ORDEM IMPORTA onde as keywords se sobrepõem:
-#  - `intersec` acima de tudo — o nome de uma interseção booleana é composto
-#    ("Intersecao Tumor x Rim") e contém os nomes das duas estruturas de origem;
-#    o amarelo-destaque da interseção deve vencer qualquer keyword contida neles.
+#  - `dentro de` acima de tudo — o nome da peça interna de uma divisão é composto
+#    ("Tumor dentro de Rim") e contém os nomes das duas estruturas de origem;
+#    o amarelo-destaque da peça interna deve vencer qualquer keyword contida
+#    neles. A peça externa ("Tumor fora de Rim") mantém a cor da estrutura de
+#    origem de propósito, então "fora de" não é keyword.
 #  - `tumor`/`lesao` em seguida — regra de produto: se tem "tumor" no nome, é verde.
 #    A lesão nunca é mascarada pelo órgão que a hospeda ("tumor de rim" é verde,
 #    não marrom de rim). Vale inclusive sobre `art`/`vei`.
 #  - `art`/`vei` em seguida: "arteria renal" / "veia renal" leem como vaso.
 #  - `renal`/`renais` por último: adjetivo genérico, não deve roubar `cortex`.
 COLORS_BY_KEYWORD: dict[str, str] = {
-    "intersec": "#FFE100",  # interseção booleana: amarelo destaque
+    "dentro de": "#FFE100",  # peça interna de uma divisão: amarelo destaque
     "tumor": "#08E700",   # tumor: verde brilhante
     "lesao": "#08E700",   # lesão: mesmo verde do tumor (compartilha bucket → varia HSV)
     "art": "#BD0006",     # artéria: vermelho escuro
@@ -163,10 +165,11 @@ def _name_based_material(
     Returns (color_hex, material, next_fallback_idx).
     """
     lower = name.lower()
-    # Uma interseção que envolva uma peça metálica ("Intersecao Stent-metal x
-    # Arteria") deve ler como destaque, não como metal polido — só nesse caso o
-    # acabamento metálico perde.
-    is_metal = METAL_KEYWORD in lower and not lower.startswith("intersecao")
+    # A peça interna de uma divisão que envolva algo metálico ("Stent metal
+    # dentro de Arteria") deve ler como destaque, não como metal polido — só
+    # nesse caso o acabamento metálico perde. A peça externa ("... fora de ...")
+    # continua metálica: ainda é o implante.
+    is_metal = METAL_KEYWORD in lower and "dentro de" not in lower
     keyword_hex = _keyword_color(lower)
     if is_metal:
         # `metal` counts as a keyword match (so it doesn't consume/shift a fallback
@@ -225,8 +228,22 @@ def _load_and_decimate(
 
 
 # Engine das operações booleanas do trimesh. `manifold` (lib manifold3d) é o
-# engine mantido/robusto; exige malhas estanques (watertight) — checado antes.
+# engine mantido/robusto; exige malhas estanques (watertight), checado antes.
 _BOOLEAN_ENGINE = "manifold"
+
+
+def _clean_boolean_result(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Remove faces degeneradas/duplicadas do resultado de uma booleana.
+
+    O manifold3d devolve algumas faces de área zero; com elas o trimesh conta
+    arestas compartilhadas por mais de duas faces e classifica o resultado como
+    NÃO estanque (euler_number 6 em vez de 2). Isso quebrava divisões
+    encadeadas, onde o resultado de uma divisão é a entrada da próxima e
+    precisa passar pela checagem `is_watertight`. `process(validate=True)`
+    limpa sem alterar o volume, então a medição de volume no viewer não muda.
+    """
+    mesh.process(validate=True)
+    return mesh
 
 
 @dataclass
@@ -242,13 +259,18 @@ class _LoadedMesh:
 def _apply_boolean_ops(
     loaded: list[_LoadedMesh], ops: list[tuple[str, str]]
 ) -> list[_LoadedMesh]:
-    """Aplica interações booleanas em sequência, na ordem configurada.
+    """Aplica as divisões (dentro/fora) em sequência, na ordem configurada.
 
-    Cada op é (principal A, secundária B), por nome de estrutura: A fica
-    intacta, B vira B−A e uma nova malha "Intersecao B x A" entra logo após B.
-    B−A vazia (B inteiramente dentro de A) remove B — sobra só a interseção.
-    Interseção vazia (não se tocam) é erro: a configuração está errada e o
-    clínico deve corrigi-la antes de processar.
+    Cada op é (referência A, estrutura a dividir B), por nome de estrutura:
+    A fica inteira; B é separada em "B fora de A" (renomeada) e uma nova malha
+    "B dentro de A", inserida logo após ela. Se "B fora de A" for vazia (B
+    inteiramente dentro de A), B some e só "B dentro de A" permanece. Sem
+    sobreposição entre as duas é erro: a configuração está errada e o clínico
+    deve corrigi-la antes de processar.
+
+    O índice é chaveado pelos nomes ORIGINAIS (os que o clínico configurou),
+    então divisões encadeadas seguem funcionando após o rename; os nomes de
+    exibição compõem ("Tumor fora de Rim dentro de Coluna").
     """
     index = {lm.name: lm for lm in loaded}
     for principal_name, secondary_name in ops:
@@ -257,13 +279,13 @@ def _apply_boolean_ops(
         if a is None or b is None:
             missing = principal_name if a is None else secondary_name
             raise ValueError(
-                f"Estrutura '{missing}' não encontrada para a interação booleana."
+                f"Estrutura '{missing}' não encontrada para a divisão."
             )
         for lm in (a, b):
             if not lm.mesh.is_watertight:
                 raise ValueError(
-                    f"A estrutura '{lm.name}' não é uma malha fechada (estanque) — "
-                    "necessário para interações booleanas."
+                    f"A estrutura '{lm.name}' não é uma malha fechada (estanque), "
+                    "necessário para dividir uma estrutura pela outra."
                 )
         try:
             inter = trimesh.boolean.intersection(
@@ -272,30 +294,37 @@ def _apply_boolean_ops(
             diff = trimesh.boolean.difference([b.mesh, a.mesh], engine=_BOOLEAN_ENGINE)
         except Exception as e:
             raise ValueError(
-                f"Interação booleana entre '{secondary_name}' e "
-                f"'{principal_name}' falhou: {e}"
+                f"A divisão de '{secondary_name}' por '{principal_name}' "
+                f"falhou: {e}"
             ) from e
+
+        if inter is not None and len(inter.faces) > 0:
+            inter = _clean_boolean_result(inter)
+        if diff is not None and len(diff.faces) > 0:
+            diff = _clean_boolean_result(diff)
 
         if inter is None or len(inter.faces) == 0:
             raise ValueError(
                 f"As estruturas '{secondary_name}' e '{principal_name}' não se "
-                "tocam — a interseção é vazia. Revise a interação booleana."
+                f"sobrepõem: não há parte de '{secondary_name}' dentro de "
+                f"'{principal_name}' para destacar. Revise a divisão."
             )
 
-        inter_name = f"Intersecao {secondary_name} x {principal_name}"
+        inter_name = f"{b.name} dentro de {a.name}"
         suffix = 2
         while inter_name in index:
-            inter_name = f"Intersecao {secondary_name} x {principal_name} {suffix}"
+            inter_name = f"{b.name} dentro de {a.name} {suffix}"
             suffix += 1
         inter_lm = _LoadedMesh(inter_name, inter, len(inter.faces), False)
 
         pos = loaded.index(b)
         if diff is None or len(diff.faces) == 0:
-            # B inteiramente dentro de A: a interseção É a B original; B some.
+            # B inteiramente dentro de A: "B dentro de A" É a B original; B some.
             loaded[pos : pos + 1] = [inter_lm]
             del index[secondary_name]
         else:
             b.mesh = diff
+            b.name = f"{b.name} fora de {a.name}"
             loaded.insert(pos + 1, inter_lm)
         index[inter_name] = inter_lm
     return loaded
@@ -308,9 +337,9 @@ def process_stls(
 ) -> tuple[bytes, ProcessStats]:
     """Build a single multi-mesh GLB from a list of (name, stl_bytes).
 
-    `boolean_ops` é uma lista de pares (principal, secundária) por nome de
-    estrutura — ver `_apply_boolean_ops`. Roda após a decimação (malhas já
-    lean) e antes da rotação RAS→glTF e da coloração.
+    `boolean_ops` é uma lista de pares (referência, estrutura a dividir) por
+    nome de estrutura — ver `_apply_boolean_ops`. Roda após a decimação (malhas
+    já lean) e antes da rotação RAS→glTF e da coloração.
     """
     if not files:
         raise ValueError("Nenhum arquivo recebido.")
