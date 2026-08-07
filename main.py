@@ -180,6 +180,11 @@ app.add_middleware(
         "http://localhost:5500",
         "http://127.0.0.1:5501",
         "http://localhost:5501",
+        # Porta do servidor estático que o Playwright do medCaseViewer levanta
+        # (playwright.config.js), para os specs de upload rodarem contra um
+        # backend local em DRY_RUN.
+        "http://127.0.0.1:5505",
+        "http://localhost:5505",
     ],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],

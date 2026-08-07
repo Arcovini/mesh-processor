@@ -48,6 +48,12 @@ htmlcov/
 *.ply
 tmp/
 uploads/
+test_output/
+test-results/
+
+# Área de rascunho dos agentes (Conductor). Estava fora do git só por um
+# .git/info/exclude local, que não acompanha o clone.
+.context/
 
 # macOS
 .DS_Store
