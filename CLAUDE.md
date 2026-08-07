@@ -124,6 +124,30 @@ Non-matched names cycle through an IBM Colorblind Safe palette (`FALLBACK_COLORS
 
 **Metal finish (special case).** A structure whose name contains `metal` (implant, screw, plate, stent) is the one case where the PBR *finish* changes, not just the color: it gets `metallicFactor=1.0` + low `roughnessFactor` (see `METAL_*` constants in `processor.py`) and a neutral steel/titanium base hex, so the viewer's environment map renders it as polished metal. Every other structure keeps the fixed `metallic=0 / roughness=0.5`. `metal` counts as a keyword match (no fallback slot consumed) and its base hex still flows through the duplicate-bucket / HSV logic, so two distinct metal parts in one case stay distinguishable.
 
+### Boolean operations between structures (STL path only)
+
+The upload page can configure **boolean interactions** as ordered pairs
+(principal A, secondary B), sent in the optional `boolean_ops` form field as
+JSON `[{"principal": "<filename>", "secondary": "<filename>"}]` (original
+filenames of the same request; `main._parse_boolean_ops` validates and maps
+them to cleaned names). Fixed product semantics, per pair, applied in order:
+
+- **A stays intact** — untouched.
+- **B is replaced by B − A** (subtraction). If empty (B fully inside A), B is
+  dropped entirely.
+- A new mesh **`Intersecao <B> x <A>`** (B ∩ A) is inserted right after B. If
+  empty (structures don't touch), the whole request fails 400 — that's a
+  misconfiguration the clinician must fix.
+
+Implementation: `processor._apply_boolean_ops`, using `trimesh.boolean` with
+the **manifold3d** engine. Runs **after decimation** (smaller meshes → faster
+boolean, lean output) and **before** the RAS→glTF rotation and coloring. Both
+operands must be watertight (`is_watertight` pre-check with a pt-BR error).
+The `intersec` keyword (top of `COLORS_BY_KEYWORD`, must win over the source
+structure names embedded in the composed name) paints intersections highlight
+yellow `#FFE100`; intersection names also veto the `metal` finish. STL-only:
+OBJ bundles reject `boolean_ops` with a 400.
+
 ### Required: force vertex-normal compute after transforms
 
 `apply_transform` invalidates trimesh's cached normals. The GLB exporter only writes the `NORMAL` attribute if normals exist on the mesh at export time. Without `NORMAL`, viewers render flat-shaded (visible triangle facets).

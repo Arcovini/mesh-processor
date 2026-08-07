@@ -7,6 +7,7 @@ This module is pure orchestration.
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import secrets
@@ -32,6 +33,65 @@ def _auto_sketchfab_name() -> str:
     return f"{date.today().isoformat()}-{secrets.randbelow(10**12):012d}"
 
 MAX_TOTAL_BYTES = 60 * 1024 * 1024  # 60 MB across all files in one request
+
+# Teto defensivo de interações booleanas por caso — um caso clínico real tem
+# poucas; dezenas indicam configuração errada (e booleana tem custo de CPU).
+MAX_BOOLEAN_OPS = 20
+
+
+def _parse_boolean_ops(raw: str, filenames: list[str]) -> list[tuple[int, int]]:
+    """Valida o form field `boolean_ops` → lista de (idx principal, idx secundária).
+
+    O campo é um JSON `[{"principal": "<filename>", "secondary": "<filename>"}]`
+    com os filenames originais do mesmo request; devolvemos índices em
+    `filenames` para o caller mapear aos nomes limpos. Campo vazio → sem ops.
+    Erros são HTTPException 400 com mensagem pt-BR (aparecem direto na tela do
+    clínico).
+    """
+    if not raw or not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            400, "Configuração de interações booleanas inválida (JSON malformado)."
+        )
+    if not isinstance(data, list):
+        raise HTTPException(
+            400, "Configuração de interações booleanas inválida (esperada uma lista)."
+        )
+    if len(data) > MAX_BOOLEAN_OPS:
+        raise HTTPException(
+            400, f"No máximo {MAX_BOOLEAN_OPS} interações booleanas por caso."
+        )
+
+    pairs: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            raise HTTPException(
+                400,
+                "Cada interação booleana precisa dos campos 'principal' e 'secondary'.",
+            )
+        indices = []
+        for key in ("principal", "secondary"):
+            value = item.get(key)
+            if value not in filenames:
+                raise HTTPException(
+                    400,
+                    f"Interação booleana referencia um arquivo não enviado: {value!r}.",
+                )
+            indices.append(filenames.index(value))
+        principal_idx, secondary_idx = indices
+        if principal_idx == secondary_idx:
+            raise HTTPException(
+                400, "Uma interação booleana precisa de duas estruturas diferentes."
+            )
+        if (principal_idx, secondary_idx) in seen:
+            raise HTTPException(400, "Interação booleana duplicada — remova a repetição.")
+        seen.add((principal_idx, secondary_idx))
+        pairs.append((principal_idx, secondary_idx))
+    return pairs
 
 # Catches "_(timestamp)" tails (with or without closing paren) as a fallback
 # when common-prefix/suffix stripping can't catch per-file unique timestamps.
@@ -188,6 +248,7 @@ def _extract_obj_bundle(
 async def upload(
     files: list[UploadFile] = File(...),
     target_triangles: int = Form(default=DEFAULT_TARGET_TRIANGLES),
+    boolean_ops: str = Form(default=""),
 ) -> dict:
     if not files:
         raise HTTPException(400, "Nenhum arquivo enviado.")
@@ -219,6 +280,13 @@ async def upload(
             "Envie apenas arquivos STL ou um único bundle OBJ — não misturados.",
         )
 
+    ops_idx = _parse_boolean_ops(boolean_ops, [n for n, _ in file_pairs])
+    if ops_idx and not is_stl_only:
+        raise HTTPException(
+            400,
+            "Interações booleanas estão disponíveis apenas para envios de arquivos STL.",
+        )
+
     if is_obj_bundle:
         obj_bytes, mtl_bytes, textures, obj_filename = _extract_obj_bundle(file_pairs)
         mesh_name = clean_mesh_names([obj_filename])[0]
@@ -231,9 +299,13 @@ async def upload(
     elif is_stl_only:
         mesh_names = clean_mesh_names([n for n, _ in file_pairs])
         stls = list(zip(mesh_names, [b for _, b in file_pairs]))
+        # As ops chegam por filename original; process_stls fala nomes limpos.
+        ops_names = [(mesh_names[p], mesh_names[s]) for p, s in ops_idx]
         try:
             glb_bytes, stats = process_stls(
-                stls, target_triangles_per_mesh=target_triangles
+                stls,
+                target_triangles_per_mesh=target_triangles,
+                boolean_ops=ops_names,
             )
         except ValueError as e:
             raise HTTPException(400, str(e))

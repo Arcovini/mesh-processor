@@ -38,12 +38,16 @@ DEFAULT_TARGET_TRIANGLES = 300_000
 # keywords são escritas sem acento.
 #
 # Primeiro match vence, então ORDEM IMPORTA onde as keywords se sobrepõem:
-#  - `tumor`/`lesao` no topo — regra de produto: se tem "tumor" no nome, é verde.
+#  - `intersec` acima de tudo — o nome de uma interseção booleana é composto
+#    ("Intersecao Tumor x Rim") e contém os nomes das duas estruturas de origem;
+#    o amarelo-destaque da interseção deve vencer qualquer keyword contida neles.
+#  - `tumor`/`lesao` em seguida — regra de produto: se tem "tumor" no nome, é verde.
 #    A lesão nunca é mascarada pelo órgão que a hospeda ("tumor de rim" é verde,
 #    não marrom de rim). Vale inclusive sobre `art`/`vei`.
 #  - `art`/`vei` em seguida: "arteria renal" / "veia renal" leem como vaso.
 #  - `renal`/`renais` por último: adjetivo genérico, não deve roubar `cortex`.
 COLORS_BY_KEYWORD: dict[str, str] = {
+    "intersec": "#FFE100",  # interseção booleana: amarelo destaque
     "tumor": "#08E700",   # tumor: verde brilhante
     "lesao": "#08E700",   # lesão: mesmo verde do tumor (compartilha bucket → varia HSV)
     "art": "#BD0006",     # artéria: vermelho escuro
@@ -159,7 +163,10 @@ def _name_based_material(
     Returns (color_hex, material, next_fallback_idx).
     """
     lower = name.lower()
-    is_metal = METAL_KEYWORD in lower
+    # Uma interseção que envolva uma peça metálica ("Intersecao Stent-metal x
+    # Arteria") deve ler como destaque, não como metal polido — só nesse caso o
+    # acabamento metálico perde.
+    is_metal = METAL_KEYWORD in lower and not lower.startswith("intersecao")
     keyword_hex = _keyword_color(lower)
     if is_metal:
         # `metal` counts as a keyword match (so it doesn't consume/shift a fallback
@@ -217,13 +224,106 @@ def _load_and_decimate(
     return mesh, input_tris, False
 
 
+# Engine das operações booleanas do trimesh. `manifold` (lib manifold3d) é o
+# engine mantido/robusto; exige malhas estanques (watertight) — checado antes.
+_BOOLEAN_ENGINE = "manifold"
+
+
+@dataclass
+class _LoadedMesh:
+    """Uma estrutura carregada/decimada, antes de rotação, cor e export."""
+
+    name: str
+    mesh: trimesh.Trimesh
+    input_triangles: int
+    decimated: bool
+
+
+def _apply_boolean_ops(
+    loaded: list[_LoadedMesh], ops: list[tuple[str, str]]
+) -> list[_LoadedMesh]:
+    """Aplica interações booleanas em sequência, na ordem configurada.
+
+    Cada op é (principal A, secundária B), por nome de estrutura: A fica
+    intacta, B vira B−A e uma nova malha "Intersecao B x A" entra logo após B.
+    B−A vazia (B inteiramente dentro de A) remove B — sobra só a interseção.
+    Interseção vazia (não se tocam) é erro: a configuração está errada e o
+    clínico deve corrigi-la antes de processar.
+    """
+    index = {lm.name: lm for lm in loaded}
+    for principal_name, secondary_name in ops:
+        a = index.get(principal_name)
+        b = index.get(secondary_name)
+        if a is None or b is None:
+            missing = principal_name if a is None else secondary_name
+            raise ValueError(
+                f"Estrutura '{missing}' não encontrada para a interação booleana."
+            )
+        for lm in (a, b):
+            if not lm.mesh.is_watertight:
+                raise ValueError(
+                    f"A estrutura '{lm.name}' não é uma malha fechada (estanque) — "
+                    "necessário para interações booleanas."
+                )
+        try:
+            inter = trimesh.boolean.intersection(
+                [b.mesh, a.mesh], engine=_BOOLEAN_ENGINE
+            )
+            diff = trimesh.boolean.difference([b.mesh, a.mesh], engine=_BOOLEAN_ENGINE)
+        except Exception as e:
+            raise ValueError(
+                f"Interação booleana entre '{secondary_name}' e "
+                f"'{principal_name}' falhou: {e}"
+            ) from e
+
+        if inter is None or len(inter.faces) == 0:
+            raise ValueError(
+                f"As estruturas '{secondary_name}' e '{principal_name}' não se "
+                "tocam — a interseção é vazia. Revise a interação booleana."
+            )
+
+        inter_name = f"Intersecao {secondary_name} x {principal_name}"
+        suffix = 2
+        while inter_name in index:
+            inter_name = f"Intersecao {secondary_name} x {principal_name} {suffix}"
+            suffix += 1
+        inter_lm = _LoadedMesh(inter_name, inter, len(inter.faces), False)
+
+        pos = loaded.index(b)
+        if diff is None or len(diff.faces) == 0:
+            # B inteiramente dentro de A: a interseção É a B original; B some.
+            loaded[pos : pos + 1] = [inter_lm]
+            del index[secondary_name]
+        else:
+            b.mesh = diff
+            loaded.insert(pos + 1, inter_lm)
+        index[inter_name] = inter_lm
+    return loaded
+
+
 def process_stls(
     files: list[tuple[str, bytes]],
     target_triangles_per_mesh: int = DEFAULT_TARGET_TRIANGLES,
+    boolean_ops: list[tuple[str, str]] | None = None,
 ) -> tuple[bytes, ProcessStats]:
-    """Build a single multi-mesh GLB from a list of (name, stl_bytes)."""
+    """Build a single multi-mesh GLB from a list of (name, stl_bytes).
+
+    `boolean_ops` é uma lista de pares (principal, secundária) por nome de
+    estrutura — ver `_apply_boolean_ops`. Roda após a decimação (malhas já
+    lean) e antes da rotação RAS→glTF e da coloração.
+    """
     if not files:
         raise ValueError("Nenhum arquivo recebido.")
+
+    loaded: list[_LoadedMesh] = []
+    for name, stl_bytes in files:
+        mesh, input_tris, decimated = _load_and_decimate(
+            stl_bytes, target_triangles_per_mesh
+        )
+        loaded.append(_LoadedMesh(name, mesh, input_tris, decimated))
+
+    if boolean_ops:
+        loaded = _apply_boolean_ops(loaded, boolean_ops)
 
     scene = trimesh.Scene()
     mesh_stats: list[MeshStats] = []
@@ -235,10 +335,8 @@ def process_stls(
     total_in = 0
     total_out = 0
 
-    for name, stl_bytes in files:
-        mesh, input_tris, decimated = _load_and_decimate(
-            stl_bytes, target_triangles_per_mesh
-        )
+    for lm in loaded:
+        name, mesh, input_tris, decimated = lm.name, lm.mesh, lm.input_triangles, lm.decimated
 
         mesh.apply_transform(_RAS_TO_GLTF)
         # Force vertex-normal compute AFTER the transform so the GLB exporter
