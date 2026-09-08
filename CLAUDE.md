@@ -124,6 +124,47 @@ Non-matched names cycle through an IBM Colorblind Safe palette (`FALLBACK_COLORS
 
 **Metal finish (special case).** A structure whose name contains `metal` (implant, screw, plate, stent) is the one case where the PBR *finish* changes, not just the color: it gets `metallicFactor=1.0` + low `roughnessFactor` (see `METAL_*` constants in `processor.py`) and a neutral steel/titanium base hex, so the viewer's environment map renders it as polished metal. Every other structure keeps the fixed `metallic=0 / roughness=0.5`. `metal` counts as a keyword match (no fallback slot consumed) and its base hex still flows through the duplicate-bucket / HSV logic, so two distinct metal parts in one case stay distinguishable.
 
+### Splitting one structure by another: dentro/fora (STL path only)
+
+The upload page can pair a **referência** (A) with a structure **a dividir**
+(B), sent in the optional `boolean_ops` form field as JSON
+`[{"principal": "<filename>", "secondary": "<filename>"}]` (original filenames
+of the same request; `main._parse_boolean_ops` validates and maps them to
+cleaned names). The field and key names are **frozen API contract**; all
+user-facing wording is clinical (never "booleana" / "interseção" — radiologists
+think anatomy, not set operations). Fixed product semantics, per pair, in order:
+
+- **A stays whole** — untouched.
+- **B is renamed `B fora de A`** and carries the geometry B − A. If that is
+  empty (B fully inside A), B is dropped entirely.
+- A new mesh **`B dentro de A`** (B ∩ A) is inserted right after B. If empty
+  (structures don't overlap), the whole request fails 400: a misconfiguration
+  the clinician must fix.
+
+Those names ARE the node names the viewer displays, so the upload preview chip
+and the viewer's structure list read identically.
+
+Implementation: `processor._apply_boolean_ops`, using `trimesh.boolean` with
+the **manifold3d** engine. Runs **after decimation** (smaller meshes → faster
+operation, lean output) and **before** the RAS→glTF rotation and coloring. Both
+operands must be watertight (`is_watertight` pre-check with a pt-BR error); the
+internal index is keyed by the **original** names, so chained splits work after
+the rename and their labels compose (`Tumor fora de Rim dentro de Coluna`).
+
+**`_clean_boolean_result` is required, not cosmetic.** manifold3d returns a few
+zero-area faces; with them trimesh counts edges shared by more than two faces
+and reports the result as NOT watertight (`euler_number` 6 instead of 2). That
+broke chained splits at the watertight pre-check and would leave "open" pieces
+that the viewer's volume mode flags with `~`. `process(validate=True)` clears it
+without changing the volume.
+
+Colors: the `dentro de` keyword sits at the top of `COLORS_BY_KEYWORD` (it must
+win over the source structure names embedded in the composed name) and paints
+the inner piece highlight yellow `#FFE100`; `fora de` is deliberately NOT a
+keyword, so the outer piece keeps its structure's own color. `dentro de` also
+vetoes the `metal` finish (the outer piece stays metallic). STL-only: OBJ
+bundles reject `boolean_ops` with a 400.
+
 ### Required: force vertex-normal compute after transforms
 
 `apply_transform` invalidates trimesh's cached normals. The GLB exporter only writes the `NORMAL` attribute if normals exist on the mesh at export time. Without `NORMAL`, viewers render flat-shaded (visible triangle facets).

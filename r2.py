@@ -54,6 +54,18 @@ def upload_glb(
 
     if _dry_run():
         print(f"[r2 DRY_RUN] upload '{key}' ({len(glb_bytes)} bytes) -> bucket={bucket}")
+        # Dev: com DRY_RUN_GLB_DIR apontando para a raiz do medCaseViewer servida
+        # localmente, o GLB é gravado em <dir>/cases/{uid}.glb e o viewer local
+        # abre o caso de verdade pelo link devolvido (ver loader.js, que tenta o
+        # caminho local antes do R2 quando roda em localhost). Sem a variável,
+        # nada é escrito e o comportamento é o de antes.
+        dev_dir = os.getenv("DRY_RUN_GLB_DIR", "").strip()
+        if dev_dir:
+            path = os.path.join(dev_dir, key)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(glb_bytes)
+            print(f"[r2 DRY_RUN] gravado em {path}")
         return
 
     try:
