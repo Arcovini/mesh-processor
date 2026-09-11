@@ -57,16 +57,38 @@ def test_boolean_splits_secondary_and_keeps_principal():
     assert abs((vol_fora + vol_dentro) - vol_original_b) / vol_original_b < 0.01
 
 
-def test_inner_piece_gets_highlight_color_over_tumor_green():
-    # O nome composto contém "tumor" e "rim"; a keyword "dentro de" deve vencer.
-    # Já "Tumor fora de Rim" mantém o verde do tumor de propósito.
+def test_inner_piece_is_a_lighter_tone_of_its_origin():
+    # "Tumor fora de Rim" mantém o verde do tumor; a peça de dentro é o mesmo
+    # verde clareado (30% do caminho até o branco): duas estruturas, mesma família.
     _, stats = process_stls(
         [("Rim", RIM), ("Tumor", TUMOR)], boolean_ops=[("Rim", "Tumor")]
     )
     dentro = next(m for m in stats.meshes if "dentro de" in m.name)
     fora = next(m for m in stats.meshes if "fora de" in m.name)
-    assert dentro.color == "#FFE100"
     assert fora.color == "#08E700"
+    assert dentro.color == "#52EE4C"
+
+
+def test_inner_piece_color_comes_from_origin_not_from_the_composed_name():
+    # "Veia dentro de Tumor" contém "tumor", que venceria "vei" na tabela de
+    # keywords. A cor tem que vir da veia (azul), não do nome composto.
+    _, stats = process_stls(
+        [("Tumor", RIM), ("Veia", TUMOR)], boolean_ops=[("Tumor", "Veia")]
+    )
+    colors = {m.name: m.color for m in stats.meshes}
+    assert colors["Veia fora de Tumor"] == "#477EFF"
+    assert colors["Veia dentro de Tumor"] == "#7EA5FF"
+
+
+def test_inner_piece_of_a_near_white_origin_gets_darker():
+    # Metal/osso já são quase brancos: clarear não se veria, então escurece.
+    _, stats = process_stls(
+        [("Arteria", RIM), ("Stent metal", TUMOR)],
+        boolean_ops=[("Arteria", "Stent metal")],
+    )
+    colors = {m.name: m.color for m in stats.meshes}
+    assert colors["Stent metal fora de Arteria"] == "#C0C4C8"
+    assert colors["Stent metal dentro de Arteria"] == "#7D7F82"
 
 
 def test_disjoint_structures_raise():
@@ -79,6 +101,8 @@ def test_secondary_fully_inside_principal_is_replaced_by_inner_piece():
         [("Rim", RIM), ("Lesao", DENTRO)], boolean_ops=[("Rim", "Lesao")]
     )
     assert [m.name for m in stats.meshes] == ["Rim", "Lesao dentro de Rim"]
+    # A lesão original sumiu, mas a peça ainda deriva do verde dela.
+    assert stats.meshes[1].color == "#52EE4C"
 
 
 def test_chained_divisions_reuse_previous_result():
@@ -102,10 +126,10 @@ def test_chained_divisions_reuse_previous_result():
         "Tumor dentro de Rim",
         "Coluna",
     ]
-    # Ambas as peças "dentro de" são destaque: a segunda varia o HSV do amarelo
-    # (mesmo bucket de cor), então basta que nenhuma caia na paleta de fallback.
+    # As duas peças "dentro de" saem do mesmo tumor, então caem no mesmo verde
+    # claro: a segunda é variada (mesmo bucket) para não ficarem iguais.
     dentro = [m.color for m in stats.meshes if "dentro de" in m.name]
-    assert dentro[0] == "#FFE100"
+    assert dentro[0] == "#52EE4C"
     assert len(set(dentro)) == 2
 
 

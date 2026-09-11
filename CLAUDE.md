@@ -158,12 +158,21 @@ broke chained splits at the watertight pre-check and would leave "open" pieces
 that the viewer's volume mode flags with `~`. `process(validate=True)` clears it
 without changing the volume.
 
-Colors: the `dentro de` keyword sits at the top of `COLORS_BY_KEYWORD` (it must
-win over the source structure names embedded in the composed name) and paints
-the inner piece highlight yellow `#FFE100`; `fora de` is deliberately NOT a
-keyword, so the outer piece keeps its structure's own color. `dentro de` also
-vetoes the `metal` finish (the outer piece stays metallic). STL-only: OBJ
-bundles reject `boolean_ops` with a 400.
+Colors: both pieces are colored from the **origin structure, never from the
+composed name** — `Veia fora de Tumor` contains "tumor" and would match the
+green. `_LoadedMesh.color_name` keeps the name the structure arrived with, and
+the outer piece (`B fora de A`) is colored by it, so it keeps B's own color. The
+inner piece (`B dentro de A`) points to B via `isolated_from` and gets a
+**lighter tone of B's final color** (`_isolated_piece_material`: 30% of the way
+to white; origins that are already near-white — bone, metal, HLS L > 0.72 —
+go 35% toward black instead). Same hue keeps the anatomy readable (the vein
+stays blue); the lightness step makes it visible that there are now two
+structures. Lighter, not darker, because darker already means "another
+structure of the same color" (`_vary_hsv`). Two inner pieces from the same
+origin (chaining) share a tint bucket and get HSV-varied. The inner piece is
+always matte, even from a `metal` origin (the outer piece stays metallic).
+The upload screen does not know these colors — it shows neutral bars. STL-only:
+OBJ bundles reject `boolean_ops` with a 400.
 
 ### Required: force vertex-normal compute after transforms
 

@@ -38,18 +38,16 @@ DEFAULT_TARGET_TRIANGLES = 300_000
 # keywords são escritas sem acento.
 #
 # Primeiro match vence, então ORDEM IMPORTA onde as keywords se sobrepõem:
-#  - `dentro de` acima de tudo — o nome da peça interna de uma divisão é composto
-#    ("Tumor dentro de Rim") e contém os nomes das duas estruturas de origem;
-#    o amarelo-destaque da peça interna deve vencer qualquer keyword contida
-#    neles. A peça externa ("Tumor fora de Rim") mantém a cor da estrutura de
-#    origem de propósito, então "fora de" não é keyword.
-#  - `tumor`/`lesao` em seguida — regra de produto: se tem "tumor" no nome, é verde.
+#  - As peças de uma divisão NÃO casam pelo nome composto: "Veia fora de Tumor"
+#    contém "tumor" e pegaria o verde. A externa é colorida pelo nome ORIGINAL
+#    da estrutura (`_LoadedMesh.color_name`) e mantém a cor dela; a interna
+#    ("dentro de") ganha um tom claro dessa cor (`_isolated_piece_material`).
+#  - `tumor`/`lesao` primeiro — regra de produto: se tem "tumor" no nome, é verde.
 #    A lesão nunca é mascarada pelo órgão que a hospeda ("tumor de rim" é verde,
 #    não marrom de rim). Vale inclusive sobre `art`/`vei`.
 #  - `art`/`vei` em seguida: "arteria renal" / "veia renal" leem como vaso.
 #  - `renal`/`renais` por último: adjetivo genérico, não deve roubar `cortex`.
 COLORS_BY_KEYWORD: dict[str, str] = {
-    "dentro de": "#FFE100",  # peça interna de uma divisão: amarelo destaque
     "tumor": "#08E700",   # tumor: verde brilhante
     "lesao": "#08E700",   # lesão: mesmo verde do tumor (compartilha bucket → varia HSV)
     "art": "#BD0006",     # artéria: vermelho escuro
@@ -165,11 +163,7 @@ def _name_based_material(
     Returns (color_hex, material, next_fallback_idx).
     """
     lower = name.lower()
-    # A peça interna de uma divisão que envolva algo metálico ("Stent metal
-    # dentro de Arteria") deve ler como destaque, não como metal polido — só
-    # nesse caso o acabamento metálico perde. A peça externa ("... fora de ...")
-    # continua metálica: ainda é o implante.
-    is_metal = METAL_KEYWORD in lower and "dentro de" not in lower
+    is_metal = METAL_KEYWORD in lower
     keyword_hex = _keyword_color(lower)
     if is_metal:
         # `metal` counts as a keyword match (so it doesn't consume/shift a fallback
@@ -191,6 +185,46 @@ def _name_based_material(
         roughnessFactor=METAL_ROUGHNESS if is_metal else 0.5,
     )
     return color_hex, material, fallback_idx
+
+
+# Peça interna de uma divisão: o mesmo tom da estrutura de origem, bem mais
+# claro. Mantém a identidade anatômica (a veia continua azul) e deixa visível
+# que agora são duas estruturas. Clarear, e não escurecer, porque escurecer já
+# é o sinal de "outra estrutura da mesma cor" (`_vary_hsv`). Origem que já é
+# quase branca (osso, metal) não tem para onde clarear: escurece.
+_ISOLATED_LIGHTEN = 0.30    # fração do caminho até o branco
+_ISOLATED_DARKEN = 0.35     # fração do caminho até o preto
+_ISOLATED_LIGHT_LIMIT = 0.72  # luminosidade HLS acima da qual escurece
+
+
+def _isolated_piece_material(
+    origin_hex: str, bucket_counts: dict[str, int]
+) -> tuple[str, PBRMaterial]:
+    """Cor + acabamento da peça "dentro de", derivados da cor final da origem.
+
+    Duas peças isoladas da mesma origem (encadear) cairiam no mesmo tom: o
+    `bucket_counts` as varia como faz com estruturas repetidas.
+    Sempre fosco, mesmo quando a origem é metal: um implante cortado em dois
+    deve ler como duas peças, e o acabamento diferente reforça isso.
+    """
+    r, g, b = _hex_to_rgb01(origin_hex)
+    lightness = colorsys.rgb_to_hls(r, g, b)[1]
+    if lightness > _ISOLATED_LIGHT_LIMIT:
+        target, t = 0.0, _ISOLATED_DARKEN
+    else:
+        target, t = 1.0, _ISOLATED_LIGHTEN
+    tint = "#" + "".join(
+        f"{int(round((c + (target - c) * t) * 255)):02X}" for c in (r, g, b)
+    )
+    within = bucket_counts.get(tint, 0)
+    bucket_counts[tint] = within + 1
+    color_hex = _vary_hsv(tint, within)
+    material = PBRMaterial(
+        baseColorFactor=[*_hex_to_rgb01(color_hex), 1.0],
+        metallicFactor=0.0,
+        roughnessFactor=0.5,
+    )
+    return color_hex, material
 
 
 def _load_and_decimate(
@@ -254,6 +288,18 @@ class _LoadedMesh:
     mesh: trimesh.Trimesh
     input_triangles: int
     decimated: bool
+    # Peça "B dentro de A": aponta para a estrutura B de onde ela saiu. A cor da
+    # peça deriva da cor de B (ver `_isolated_piece_material`), por identidade
+    # do objeto e não pelo nome.
+    isolated_from: "_LoadedMesh | None" = None
+    # Nome com que a estrutura chegou, antes das divisões. É por ele que a cor é
+    # escolhida: o nome composto contém as duas estruturas e casaria com a
+    # keyword errada ("Veia fora de Tumor" pegaria o verde do tumor).
+    color_name: str = ""
+
+    def __post_init__(self):
+        if not self.color_name:
+            self.color_name = self.name
 
 
 def _apply_boolean_ops(
@@ -315,7 +361,9 @@ def _apply_boolean_ops(
         while inter_name in index:
             inter_name = f"{b.name} dentro de {a.name} {suffix}"
             suffix += 1
-        inter_lm = _LoadedMesh(inter_name, inter, len(inter.faces), False)
+        inter_lm = _LoadedMesh(
+            inter_name, inter, len(inter.faces), False, isolated_from=b
+        )
 
         pos = loaded.index(b)
         if diff is None or len(diff.faces) == 0:
@@ -361,6 +409,11 @@ def process_stls(
     # tumor+lesão sharing green, or fallback palette wrapping), vary V/S so the
     # viewer's per-structure toggles remain visually distinguishable.
     bucket_counts: dict[str, int] = {}
+    # Cor final de cada estrutura já colorida, para a peça "dentro de" derivar
+    # a sua da estrutura de origem. A origem sempre vem antes na lista (a peça
+    # é inserida logo depois dela), exceto quando some por estar inteira dentro
+    # da referência — aí a cor dela é calculada na hora, como seria.
+    colors_by_mesh: dict[int, str] = {}
     total_in = 0
     total_out = 0
 
@@ -372,9 +425,20 @@ def process_stls(
         # includes the NORMAL attribute; without it the viewer renders flat-shaded.
         _ = mesh.vertex_normals
 
-        color_hex, material, fallback_idx = _name_based_material(
-            name, bucket_counts, fallback_idx
-        )
+        origin = lm.isolated_from
+        if origin is None:
+            color_hex, material, fallback_idx = _name_based_material(
+                lm.color_name, bucket_counts, fallback_idx
+            )
+        else:
+            origin_hex = colors_by_mesh.get(id(origin))
+            if origin_hex is None:
+                origin_hex, _, fallback_idx = _name_based_material(
+                    origin.color_name, bucket_counts, fallback_idx
+                )
+            color_hex, material = _isolated_piece_material(origin_hex, bucket_counts)
+        material.name = name
+        colors_by_mesh[id(lm)] = color_hex
         mesh.visual = TextureVisuals(material=material)
 
         scene.add_geometry(mesh, node_name=name, geom_name=name)
