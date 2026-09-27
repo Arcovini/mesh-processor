@@ -16,3 +16,12 @@ boto3==1.35.0
 # Pinada explicitamente porque o caminho de upload OBJ depende disso e nada
 # mais na lista a puxa transitivamente.
 Pillow==11.0.0
+# Exame de imagem (exam.py): série DICOM → NRRD canônico. pylibjpeg-* são os
+# decodificadores das séries comprimidas que vêm do PACS (JPEG, JPEG-LS,
+# JPEG2000, RLE); têm wheels cp312 x86_64/aarch64, sem compilar nada.
+pydicom==3.0.2
+pylibjpeg==2.1.0
+pylibjpeg-libjpeg==2.3.0
+pylibjpeg-openjpeg==2.6.0
+pylibjpeg-rle==2.2.0
+pynrrd==1.1.3

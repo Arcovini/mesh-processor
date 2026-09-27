@@ -91,8 +91,27 @@ FALLBACK_COLORS: list[str] = [
     "#FE6100",  # orange
 ]
 
-# RAS (Z-up) -> glTF (Y-up). Rotate -90° around X so Z becomes Y.
+# Z-up (paciente) -> glTF (Y-up). Rotate -90° around X so Z becomes Y.
+# O nome diz RAS por história: o 3D Slicer exporta STL em LPS por padrão, e
+# nada aqui troca o sinal de x/y — então o GLB fica em LPS rotacionado. O
+# visualizador aplica esta MESMA rotação ao exame (NRRD, sempre LPS) para os
+# cortes caírem em cima das malhas. STL marcado como RAS é levado para LPS
+# antes (ver `_ras_header_to_lps`). Não mude isto sem mudar exam-geom.js.
 _RAS_TO_GLTF = trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0])
+
+# RAS -> LPS: nega x e y. É uma rotação de 180° em torno de S (det = +1), não
+# um espelhamento — a malha não vira do avesso.
+_RAS_TO_LPS = np.diag([-1.0, -1.0, 1.0, 1.0])
+
+
+def _ras_header_to_lps(stl_bytes: bytes) -> bool:
+    """True se o STL declara `SPACE=RAS` no cabeçalho (como o 3D Slicer grava).
+
+    O Slicer escreve `SPACE=LPS` ou `SPACE=RAS` nos 80 bytes de cabeçalho do STL
+    binário (ou depois de `solid` no ASCII). Sem a marca, assumimos LPS, como o
+    próprio Slicer faz ao ler.
+    """
+    return b"SPACE=RAS" in stl_bytes[:256]
 
 
 @dataclass
@@ -249,6 +268,11 @@ def _load_and_decimate(
 
     if not isinstance(mesh, trimesh.Trimesh):
         raise ValueError("Arquivo STL não pôde ser carregado como uma única malha.")
+
+    # Tudo em LPS antes das divisões e da rotação: estruturas do mesmo caso
+    # continuam registradas entre si e com o exame de imagem.
+    if _ras_header_to_lps(stl_bytes):
+        mesh.apply_transform(_RAS_TO_LPS)
 
     input_tris = len(mesh.faces)
     if input_tris > target_triangles:

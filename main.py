@@ -1,11 +1,14 @@
 """FastAPI app — orchestrates multi-STL upload, mesh processing and Sketchfab publishing.
 
 Reads env, validates on startup, exposes 3 endpoints, handles CORS.
-All mesh work is delegated to processor.py; all Sketchfab work to sketchfab.py.
+All mesh work is delegated to processor.py; the image exam (DICOM/NRRD) to
+exam.py; all Sketchfab work to sketchfab.py; storage to r2.py.
 This module is pure orchestration.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -18,8 +21,14 @@ from datetime import date
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from processor import DEFAULT_TARGET_TRIANGLES, process_obj_bundle, process_stls
-from r2 import R2Error, upload_glb
+from exam import ExamStats, normalize_exam
+from processor import (
+    DEFAULT_TARGET_TRIANGLES,
+    ProcessStats,
+    process_obj_bundle,
+    process_stls,
+)
+from r2 import R2Error, upload_exam, upload_exam_meta, upload_glb
 from sketchfab import SketchfabError, get_status, upload_model
 
 # Accepted texture extensions inside an OBJ bundle. Most photogrammetry exports
@@ -32,7 +41,20 @@ def _auto_sketchfab_name() -> str:
     """YYYY-MM-DD-<12 random digits>. Placeholder id until the DB layer lands."""
     return f"{date.today().isoformat()}-{secrets.randbelow(10**12):012d}"
 
-MAX_TOTAL_BYTES = 60 * 1024 * 1024  # 60 MB across all files in one request
+MAX_TOTAL_BYTES = 60 * 1024 * 1024  # 60 MB across all mesh files in one request
+
+# Exame de imagem (campo `exam`): teto separado do dos modelos. 200 MB cabem nos
+# 5 min que o Railway dá para o corpo do request chegar numa conexão de ~8 Mbps.
+MAX_EXAM_BYTES = 200 * 1024 * 1024
+# O parser multipart do Starlette recusa mais de 1000 arquivos com uma mensagem
+# genérica em inglês; abaixo disso pedimos o .zip em português.
+MAX_EXAM_FILES = 900
+# Séries por caso (sem contraste, arterial, portal, tardia). Cada uma chega num
+# request próprio: 4 fases de TC fina (~1 GB) não cabem num corpo só nos 5 min
+# do Railway. A série 0 vem no /upload; as outras em POST /cases/{uid}/exam.
+MAX_EXAM_SERIES = 4
+
+_UID_RE = re.compile(r"[0-9a-f]{32}")
 
 # Teto defensivo de divisões (dentro/fora) por caso — um caso clínico real tem
 # poucas; dezenas indicam configuração errada (e a operação tem custo de CPU).
@@ -154,12 +176,21 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET = os.getenv("R2_BUCKET", "clinical-3d")
 
+# Assina o write_token das séries extras do exame (HMAC do uid). Sem estado e
+# sem banco: quem recebeu o token no /upload pode acrescentar séries àquele
+# caso; quem só tem o link do visualizador, não. Trocar o segredo invalida os
+# tokens em uso — só afeta uploads em andamento, porque a página não os guarda.
+EXAM_WRITE_SECRET = os.getenv("EXAM_WRITE_SECRET", "") or (
+    "dev-only-exam-write-secret" if DRY_RUN else ""
+)
+
 if not DRY_RUN:
     _required = {
         "SKETCHFAB_TOKEN": SKETCHFAB_TOKEN,
         "R2_ACCOUNT_ID": R2_ACCOUNT_ID,
         "R2_ACCESS_KEY_ID": R2_ACCESS_KEY_ID,
         "R2_SECRET_ACCESS_KEY": R2_SECRET_ACCESS_KEY,
+        "EXAM_WRITE_SECRET": EXAM_WRITE_SECRET,
     }
     _missing = [name for name, value in _required.items() if not value]
     if _missing:
@@ -250,19 +281,16 @@ def _extract_obj_bundle(
     return objs[0][1], mtl_bytes, textures, objs[0][0]
 
 
-@app.post("/upload")
-async def upload(
-    files: list[UploadFile] = File(...),
-    target_triangles: int = Form(default=DEFAULT_TARGET_TRIANGLES),
-    boolean_ops: str = Form(default=""),
-) -> dict:
-    if not files:
-        raise HTTPException(400, "Nenhum arquivo enviado.")
+def _read_mesh_files(files: list[UploadFile]) -> list[tuple[str, bytes]]:
+    """Lê os arquivos do modelo e aplica as checagens baratas (vazio, 60 MB).
 
+    Vem antes do exame: um STL vazio ou grande demais é recusado na hora, e não
+    depois de dezenas de segundos normalizando uma série DICOM.
+    """
     file_pairs: list[tuple[str, bytes]] = []
     total_size = 0
     for f in files:
-        contents = await f.read()
+        contents = f.file.read()
         if len(contents) == 0:
             raise HTTPException(400, f"Arquivo vazio: {f.filename or '(sem nome)'}.")
         total_size += len(contents)
@@ -272,7 +300,13 @@ async def upload(
                 f"Soma dos arquivos ultrapassa {MAX_TOTAL_BYTES // (1024 * 1024)}MB.",
             )
         file_pairs.append((f.filename or "", contents))
+    return file_pairs
 
+
+def _process_meshes(
+    file_pairs: list[tuple[str, bytes]], target_triangles: int, boolean_ops: str
+) -> tuple[bytes, ProcessStats]:
+    """STLs ou bundle OBJ → GLB. Erros viram HTTPException 400 em pt-BR."""
     # Sniff input shape: all STL vs OBJ bundle (zip or loose). Reject mixed —
     # the colour-by-keyword path (STL) and the preserve-texture path (OBJ) are
     # fundamentally different and combining them produces a confusing result.
@@ -293,80 +327,266 @@ async def upload(
             "A divisão de estruturas está disponível apenas para envios de arquivos STL.",
         )
 
-    if is_obj_bundle:
-        obj_bytes, mtl_bytes, textures, obj_filename = _extract_obj_bundle(file_pairs)
-        mesh_name = clean_mesh_names([obj_filename])[0]
-        try:
-            glb_bytes, stats = process_obj_bundle(
-                obj_bytes, mtl_bytes, textures, mesh_name
-            )
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-    elif is_stl_only:
-        mesh_names = clean_mesh_names([n for n, _ in file_pairs])
-        stls = list(zip(mesh_names, [b for _, b in file_pairs]))
-        # As ops chegam por filename original; process_stls fala nomes limpos.
-        ops_names = [(mesh_names[p], mesh_names[s]) for p, s in ops_idx]
-        try:
-            glb_bytes, stats = process_stls(
+    try:
+        if is_obj_bundle:
+            obj_bytes, mtl_bytes, textures, obj_filename = _extract_obj_bundle(file_pairs)
+            mesh_name = clean_mesh_names([obj_filename])[0]
+            return process_obj_bundle(obj_bytes, mtl_bytes, textures, mesh_name)
+        if is_stl_only:
+            mesh_names = clean_mesh_names([n for n, _ in file_pairs])
+            stls = list(zip(mesh_names, [b for _, b in file_pairs]))
+            # As ops chegam por filename original; process_stls fala nomes limpos.
+            ops_names = [(mesh_names[p], mesh_names[s]) for p, s in ops_idx]
+            return process_stls(
                 stls,
                 target_triangles_per_mesh=target_triangles,
                 boolean_ops=ops_names,
             )
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-    else:
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    raise HTTPException(
+        400,
+        "Tipo de arquivo não reconhecido. Envie arquivos .stl ou um bundle OBJ "
+        "(.obj + .mtl + imagem, soltos ou em .zip).",
+    )
+
+
+def _normalize_exam(exam: list[UploadFile]) -> tuple[bytes, ExamStats]:
+    """Campo `exam` → NRRD canônico (exam.py). Erro de entrada → 400/413.
+
+    Roda ANTES de qualquer upload: um exame recusado não deixa GLB órfão no
+    R2 nem modelo criado à toa no Sketchfab.
+    """
+    if len(exam) > MAX_EXAM_FILES:
         raise HTTPException(
             400,
-            "Tipo de arquivo não reconhecido. Envie arquivos .stl ou um bundle OBJ "
-            "(.obj + .mtl + imagem, soltos ou em .zip).",
+            f"O exame tem {len(exam)} arquivos; o limite para arquivos soltos é "
+            f"{MAX_EXAM_FILES}. Envie a série compactada em um único .zip.",
         )
-
-    sketchfab_name = _auto_sketchfab_name()
-
-    try:
-        uid = upload_model(glb_bytes, name=sketchfab_name, token=SKETCHFAB_TOKEN)
-    except SketchfabError as e:
-        raise HTTPException(502, str(e))
-
-    # Best-effort parallel push to R2. Sketchfab is the source of truth in
-    # Sprint 2; R2 is a backup that Sprint 3 will migrate the viewer to.
-    # Failures here log loudly but do not break the request — the clinician
-    # already has a working viewer link via Sketchfab.
-    try:
-        upload_glb(
-            glb_bytes,
-            uid=uid,
-            bucket=R2_BUCKET,
-            account_id=R2_ACCOUNT_ID,
-            access_key=R2_ACCESS_KEY_ID,
-            secret_key=R2_SECRET_ACCESS_KEY,
+    total = sum(f.size or 0 for f in exam)
+    if total > MAX_EXAM_BYTES:
+        raise HTTPException(
+            413,
+            f"O exame soma {total / 1024 / 1024:.0f} MB e ultrapassa o limite de "
+            f"{MAX_EXAM_BYTES // (1024 * 1024)} MB.",
         )
-        print(f"[r2] uploaded cases/{uid}.glb")
-    except R2Error as e:
-        print(f"[r2 ERROR] failed cases/{uid}.glb: {e}")
+    # Gerador: exam.py lê um arquivo de cada vez (o FastAPI já guardou cada
+    # upload num arquivo temporário), então o pico de memória é o volume, não
+    # a soma dos arquivos.
+    items = ((f.filename or "", f.file.read()) for f in exam)
+    try:
+        return normalize_exam(items)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+def _write_token(uid: str) -> str:
+    return hmac.new(EXAM_WRITE_SECRET.encode(), uid.encode(), hashlib.sha256).hexdigest()
+
+
+def _exam_info(stats: ExamStats, n: int) -> dict:
+    """O que a resposta conta sobre uma série (o JSON no R2 é um recorte disto)."""
+    return {
+        "stored": True,
+        "index": n,
+        "label": stats.label or f"Série {n + 1}",
+        "source": stats.source,
+        "shape": list(stats.shape),
+        "spacing": list(stats.spacing),
+        "downsample": list(stats.downsample),
+        "size_mb": round(stats.nrrd_bytes / (1024 * 1024), 2),
+        "ignored_files": stats.ignored_files,
+        "modality": stats.modality,
+    }
+
+
+def _store_exam_series(nrrd: bytes, info: dict, uid: str, r2: dict) -> None:
+    """NRRD e depois o JSON da série. O JSON é o que faz a série existir para o
+    visualizador: um NRRD órfão (falha entre os dois puts) fica invisível e é
+    sobrescrito na nova tentativa. Levanta R2Error."""
+    n = info["index"]
+    # Público no R2: do cabeçalho DICOM, só o nome da série (decisão do
+    # usuário). Nem a modalidade vai — o visualizador não precisa dela.
+    meta = {
+        "version": 1,
+        "label": info["label"],
+        "images": info["shape"][2],
+        "shape": info["shape"],
+        "spacing": info["spacing"],
+        "bytes": len(nrrd),
+    }
+    upload_exam(nrrd, uid=uid, n=n, **r2)
+    upload_exam_meta(json.dumps(meta, ensure_ascii=False).encode("utf-8"), uid=uid, n=n, **r2)
+    print(f"[r2] uploaded cases/{uid}.exam-{n}.nrrd + .json")
+
+
+def _r2() -> dict:
+    return dict(
+        bucket=R2_BUCKET,
+        account_id=R2_ACCOUNT_ID,
+        access_key=R2_ACCESS_KEY_ID,
+        secret_key=R2_SECRET_ACCESS_KEY,
+    )
+
+
+def _log_exam(stats: ExamStats) -> None:
+    print(
+        f"[exam] {stats.source} {stats.input_files} arquivo(s) "
+        f"(ignorados {stats.ignored_files}) -> {stats.shape} "
+        f"{stats.dtype} downsample={stats.downsample} "
+        f"{stats.nrrd_bytes / 1024 / 1024:.1f} MB modality={stats.modality} "
+        f"label={stats.label!r}"
+    )
+
+
+# `def` (e não `async def`): o FastAPI roda a função num thread pool. O
+# processamento é CPU pura (decimação, divisões, decodificar e comprimir o
+# exame — dezenas de segundos numa série grande); num `async def` isso travaria
+# o event loop e o /status e o /health parariam de responder durante o upload.
+@app.post("/upload")
+def upload(
+    files: list[UploadFile] = File(default=[]),
+    exam: list[UploadFile] = File(default=[]),
+    target_triangles: int = Form(default=DEFAULT_TARGET_TRIANGLES),
+    boolean_ops: str = Form(default=""),
+) -> dict:
+    if not files and not exam:
+        raise HTTPException(400, "Nenhum arquivo enviado.")
+
+    # 0) Checagens baratas do modelo antes do trabalho pesado do exame.
+    file_pairs = _read_mesh_files(files) if files else []
+    if file_pairs:
+        _parse_boolean_ops(boolean_ops, [n for n, _ in file_pairs])
+
+    # 1) Exame primeiro: é o que mais pode ser recusado (série misturada,
+    #    imagens faltando) e o mais caro de descobrir depois.
+    exam_bytes: bytes | None = None
+    exam_stats: ExamStats | None = None
+    if exam:
+        exam_bytes, exam_stats = _normalize_exam(exam)
+        _log_exam(exam_stats)
+
+    # 2) Modelo 3D, se houver.
+    glb_bytes: bytes | None = None
+    stats: ProcessStats | None = None
+    if file_pairs:
+        glb_bytes, stats = _process_meshes(file_pairs, target_triangles, boolean_ops)
+
+    r2 = _r2()
+
+    # 3) Destinos. Com modelo, o uid ainda é o do Sketchfab (fonte da verdade
+    #    até o Sprint 3c). Caso só com exame nunca toca o Sketchfab: o uid é
+    #    nosso, e o visualizador acha o exame pelo cases/{uid}.exam-0.json.
+    sketchfab_name: str | None = None
+    if glb_bytes is not None:
+        sketchfab_name = _auto_sketchfab_name()
+        try:
+            uid = upload_model(glb_bytes, name=sketchfab_name, token=SKETCHFAB_TOKEN)
+        except SketchfabError as e:
+            raise HTTPException(502, str(e))
+
+        # Best-effort parallel push to R2. Sketchfab is the source of truth in
+        # Sprint 2; R2 is a backup that Sprint 3 will migrate the viewer to.
+        # Failures here log loudly but do not break the request — the clinician
+        # already has a working viewer link via Sketchfab.
+        try:
+            upload_glb(glb_bytes, uid=uid, **r2)
+            print(f"[r2] uploaded cases/{uid}.glb")
+        except R2Error as e:
+            print(f"[r2 ERROR] failed cases/{uid}.glb: {e}")
+    else:
+        uid = secrets.token_hex(16)
+
+    # A série do /upload é sempre a 0: a que as estruturas usaram (a página
+    # manda primeiro a que o clínico marcou como "usada na segmentação").
+    exam_info: dict | None = None
+    write_token: str | None = None
+    if exam_bytes is not None and exam_stats is not None:
+        exam_info = _exam_info(exam_stats, 0)
+        # Falha de infraestrutura no exame. Com modelo: best-effort, como o GLB —
+        # o link do caso continua valendo e a resposta diz que o exame não foi
+        # guardado. Sem modelo o exame É o caso: sem ele o link abriria
+        # "caso não encontrado", então o request falha.
+        try:
+            _store_exam_series(exam_bytes, exam_info, uid, r2)
+            # Só com a série 0 gravada faz sentido acrescentar outras.
+            write_token = _write_token(uid)
+        except R2Error as e:
+            print(f"[exam ERROR] failed cases/{uid}.exam-0: {e}")
+            if glb_bytes is None:
+                raise HTTPException(
+                    502, "Não foi possível guardar o exame agora. Tente enviar de novo."
+                )
+            exam_info["stored"] = False
+            exam_info["error"] = "O exame não pôde ser guardado. Tente enviar de novo."
 
     return {
         "uid": uid,
         "viewer_url": f"{VIEWER_BASE}?id={uid}",
         "sketchfab_name": sketchfab_name,
-        "stats": {
-            "total_input_triangles": stats.total_input_triangles,
-            "total_output_triangles": stats.total_output_triangles,
-            "glb_size_mb": round(stats.glb_size_bytes / (1024 * 1024), 2),
-            "meshes": [
-                {
-                    "name": m.name,
-                    "input_triangles": m.input_triangles,
-                    "output_triangles": m.output_triangles,
-                    "decimated": m.decimated,
-                    "color": m.color or None,
-                }
-                for m in stats.meshes
-            ],
-        },
-        "processing": True,
+        "stats": (
+            {
+                "total_input_triangles": stats.total_input_triangles,
+                "total_output_triangles": stats.total_output_triangles,
+                "glb_size_mb": round(stats.glb_size_bytes / (1024 * 1024), 2),
+                "meshes": [
+                    {
+                        "name": m.name,
+                        "input_triangles": m.input_triangles,
+                        "output_triangles": m.output_triangles,
+                        "decimated": m.decimated,
+                        "color": m.color or None,
+                    }
+                    for m in stats.meshes
+                ],
+            }
+            if stats is not None
+            else None
+        ),
+        "exam": exam_info,
+        # Autoriza POST /cases/{uid}/exam (séries 1..3). A página guarda só na
+        # memória; None quando o caso não tem exame gravado.
+        "write_token": write_token,
+        # Só o Sketchfab processa depois da resposta. Sem modelo não há nada a
+        # esperar e a página de upload vai direto para o link.
+        "processing": glb_bytes is not None,
     }
+
+
+@app.post("/cases/{uid}/exam")
+def add_exam_series(
+    uid: str,
+    write_token: str = Form(...),
+    index: int = Form(...),
+    exam: list[UploadFile] = File(...),
+) -> dict:
+    """Série extra (1..3) do exame de um caso criado pelo /upload.
+
+    Idempotente: o mesmo `index` sobrescreve — é assim que a página tenta de
+    novo uma série que falhou. O servidor não confere se a série alinha com as
+    estruturas (FrameOfReferenceUID): a página faz isso antes de enviar, e
+    clientes de API são confiáveis.
+    """
+    # Bytes: compare_digest com str não-ASCII (token forjado) lança TypeError.
+    token_ok = hmac.compare_digest(write_token.encode(), _write_token(uid).encode())
+    if not _UID_RE.fullmatch(uid) or not token_ok:
+        raise HTTPException(403, "Este envio não tem permissão para alterar o caso.")
+    if not 1 <= index < MAX_EXAM_SERIES:
+        raise HTTPException(
+            400, f"Um caso tem no máximo {MAX_EXAM_SERIES} séries de exame."
+        )
+    nrrd, stats = _normalize_exam(exam)
+    _log_exam(stats)
+    info = _exam_info(stats, index)
+    try:
+        _store_exam_series(nrrd, info, uid, _r2())
+    except R2Error as e:
+        print(f"[exam ERROR] failed cases/{uid}.exam-{index}: {e}")
+        raise HTTPException(
+            502, "Não foi possível guardar esta série agora. Tente enviar de novo."
+        )
+    return {"uid": uid, "exam": info}
 
 
 @app.get("/status/{uid}")

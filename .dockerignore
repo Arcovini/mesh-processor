@@ -22,3 +22,6 @@ test_output/
 
 # Docs/meta that don't need to run in the container
 CLAUDE.md
+
+# Scripts de desenvolvimento (precisam de requirements-dev.txt)
+scripts/

@@ -26,6 +26,18 @@ uvicorn main:app --reload --port 8000
 
 For most dev work, `DRY_RUN=true` in `.env` is enough — see "DRY_RUN" below.
 
+Tests (pytest; the dev extras bring pytest, httpx for FastAPI's TestClient and
+scikit-image for `scripts/nrrd_to_stl.py`):
+
+```bash
+pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q test_exam.py test_upload_exam.py test_boolean.py test_obj_materials.py
+```
+
+From Claude Code, the workspace `.claude/launch.json` has `mesh-processor-dry`:
+the same uvicorn in DRY_RUN with `DRY_RUN_GLB_DIR` pointing at the viewer root
+and `VIEWER_BASE=http://127.0.0.1:5500/case/`, so a local upload opens locally.
+
 ### Testing the upload endpoint
 
 Multi-file form (normal case — one clinical case has several structures):
@@ -57,8 +69,9 @@ Hosted on Railway **transitionally**. Push to `main` triggers auto-deploy. Railw
 - `R2_SECRET_ACCESS_KEY` — R2 token Secret (secret)
 - `R2_BUCKET` — defaults to `clinical-3d` if unset
 - `VIEWER_BASE` — defaults to `https://biodesignlab.com.br/case/`
+- `EXAM_WRITE_SECRET` — signs the `write_token` that lets the upload page add exam series 1..3 to a case (secret; any long random string — rotating it only breaks uploads in progress). Set it via Railway's Raw Editor.
 - `PORT` — set automatically by Railway
-- `DRY_RUN` — leave unset (or `false`) in production. Boot fails loudly if any of the SKETCHFAB / R2 secrets are missing while DRY_RUN is off, by design.
+- `DRY_RUN` — leave unset (or `false`) in production. Boot fails loudly if any of the SKETCHFAB / R2 secrets or `EXAM_WRITE_SECRET` are missing while DRY_RUN is off, by design.
 
 **Future host: Google Cloud Run** when migration triggers fire (LGPD pressure, GPU need for Sprint 4+, or cost crossover). Because this service runs entirely from `Dockerfile` with env vars at the edges, the migration is primarily learning `gcloud` CLI and re-setting env vars in the target dashboard. See the workspace-level `CLAUDE.md` for the full hosting strategy and triggers.
 
@@ -68,10 +81,14 @@ Hosted on Railway **transitionally**. Push to `main` triggers auto-deploy. Railw
 
 ```
 mesh-processor/
-├── main.py          # FastAPI app — /upload, /status, /health. Pure orchestration.
+├── main.py          # FastAPI app — /upload, /cases/{uid}/exam, /status, /health. Pure orchestration.
 ├── processor.py     # STL(s) → scene → multi-mesh GLB (pure, testable, no I/O)
 ├── sketchfab.py     # Sketchfab API client. Thin. DRY_RUN short-circuit inside.
 ├── r2.py            # Cloudflare R2 client (S3-compatible via boto3). Thin. DRY_RUN short-circuit inside.
+├── exam.py          # Image exam (DICOM series / zip / NRRD) → canonical NRRD (pure, no I/O)
+├── test_exam.py, test_upload_exam.py  # pytest: exam.py and the `exam` field end to end
+├── scripts/nrrd_to_stl.py  # dev only: marching-cubes STL from a NRRD + the sphere test pair (and its 2nd series)
+├── scripts/upload_fixtures.py  # dev only: the multi-series DICOM fixtures of medCaseViewer/tests/upload
 ├── test_processor.py  # Informal smoke test against real STLs (not pytest)
 ├── .env.example     # Template for SKETCHFAB_TOKEN, VIEWER_BASE, R2_*, DRY_RUN
 ├── Dockerfile
@@ -100,7 +117,7 @@ These defaults exist because this is **medical/surgical data**, not generic 3D c
 - **Target triangle count: 300,000 per mesh** (not per scene). Preserves anatomical detail (fractures, calcifications, vessel branches) while keeping each structure lean. Configurable per request via `target_triangles` form field.
 - **Decimation algorithm: `fast_simplification` (quadric edge collapse).** Chosen over `pymeshlab` (heavy install, GPL) and `trimesh.simplify_quadric_decimation` (slower, less stable on large meshes).
 - **No aggressive smoothing.** `trimesh.load(process=True)` does safe cleanup (duplicate vertices, normals). Anything more (Laplacian smoothing, Taubin) can round off clinically relevant features and is **off by default**. If a future request needs it, gate it behind an explicit flag, not a default.
-- **Coordinate system: STL is RAS (Z-up), glTF is Y-up.** We apply a fixed `-π/2` rotation around X so each mesh lands upright in the viewer. The rotation is identical for every mesh in a batch, preserving inter-structure spatial relationships (a kidney, its artery, its vein, and a lesion from the same exam stay co-registered).
+- **Coordinate system: STL is patient space, Z-up (LPS, the 3D Slicer default); glTF is Y-up.** We apply a fixed `-π/2` rotation around X so each mesh lands upright in the viewer (`_RAS_TO_GLTF` — the name is historical; no x/y sign flip happens, so the GLB is **LPS rotated**). The rotation is identical for every mesh in a batch, preserving inter-structure spatial relationships (a kidney, its artery, its vein, and a lesion from the same exam stay co-registered). An STL whose 80-byte header says `SPACE=RAS` (Slicer writes `SPACE=LPS` or `SPACE=RAS` there) is first rotated 180° about S (`diag(-1,-1,1)`) to LPS. The viewer applies the same rotation to the image exam (`medCaseViewer/case/exam-geom.js`) — **change both or neither**.
 - **Output format: GLB binary.** Smaller than glTF+bin, single file, native browser support. Sketchfab's preferred format.
 - **Per-mesh PBR materials, not vertex colors.** Each structure gets a named `PBRMaterial` (`baseColorFactor` + `roughnessFactor=0.5` + `metallicFactor=0`). Reason: Sketchfab's viewer API (`api.setMaterial`) operates on the *material list*. Without distinct materials, the viewer's opacity slider per structure cannot function. Vertex colors would render visually but would be a single material in the viewer.
 
@@ -174,6 +191,99 @@ always matte, even from a `metal` origin (the outer piece stays metallic).
 The upload screen does not know these colors — it shows neutral bars. STL-only:
 OBJ bundles reject `boolean_ops` with a 400.
 
+### Image exam: the `exam` field and extra series (DICOM series or NRRD → canonical NRRD)
+
+A case can also carry the imaging exam it was segmented from — up to 4 series
+(e.g. arterial and nephrographic phases); the viewer shows axial/coronal/sagittal
+slices, the planes inside the 3D scene, and a series switcher. A case may be
+structures only, exam only, or both.
+
+- **One series per request** (Railway gives a request body 5 minutes; 4 thin CT
+  phases are ~1 GB). Series 0 — the one the structures were segmented on — comes
+  in `POST /upload`; series 1..3 in `POST /cases/{uid}/exam`.
+- **`POST /upload`:** `exam` is a repeated multipart field like `files` (frozen
+  name): N DICOM files (extension irrelevant — sniffed by the `DICM` preamble;
+  raw datasets without preamble/file meta are read with `force` and get their
+  Transfer Syntax from the encoding they were read with, `_ensure_transfer_syntax`),
+  **or** one `.zip` of the series (what the upload page always sends for DICOM:
+  a zip built in the browser with only the chosen series), **or** one `.nrrd`.
+  Mixing → 400. `files` is optional; the request needs `files` or `exam`. When
+  series 0 is stored, the response carries `write_token` =
+  HMAC-SHA256(`EXAM_WRITE_SECRET`, uid) — stateless, no DB.
+- **`POST /cases/{uid}/exam`:** form `write_token`, `index` (1..3), `exam` (one
+  series, same normalization and limits). Wrong token or malformed uid → 403;
+  `index` out of range → 400; R2 failure → 502. **Idempotent**: the same index
+  overwrites — that is the upload page's "Tentar de novo". The server does not
+  check that the series aligns with the structures (FrameOfReferenceUID): the
+  page does it before sending; API clients are trusted.
+- **Limits** (`main.py`), per request: `MAX_EXAM_BYTES` 200 MB (separate from
+  the 60 MB mesh cap; fits the 5-min window at ~8 Mbps), `MAX_EXAM_FILES` 900
+  (Starlette's multipart parser refuses >1000 files with an English message; we
+  ask for the `.zip` in Portuguese first); `MAX_EXAM_SERIES` 4 per case. Peak
+  memory measured on 2026-09-26: ~630 MB for a 500 MB (unzipped) series, ~3 s
+  (`exam._read_dicom` keeps the series' datasets until stacking) — the Railway
+  plan needs ≥ 1 GB for the service.
+- **`exam.py` (pure):** reads one file at a time (keeps only position + pixels),
+  groups by `SeriesInstanceUID`, drops series with < 8 images (localizer,
+  scout, dose report) and images whose `ImageType` contains `LOCALIZER` (the
+  plane-reference image Siemens stores *inside* MPR/MIP reformat series, in
+  another orientation — without this a coronal reformat was refused as "mixed
+  orientation"; found on a public TCIA CT, TCGA-CW-5590), refuses more than one
+  remaining series (400 listing
+  them — never "pick the biggest": the wrong phase would still look plausible),
+  refuses mixed orientation, gaps/missing images, duplicate positions and
+  multi-frame (logged). Sorts by position along the normal (never
+  InstanceNumber). Geometry: `i = IOP[0:3]·PixelSpacing[1]`,
+  `j = IOP[3:6]·PixelSpacing[0]`, `k = (IPP_last − IPP_first)/(n−1)`,
+  origin = first IPP. Modality LUT in int32; output `int16` if it fits, else
+  `uint16`, else `float32`. MONOCHROME1 is inverted. Above `MAX_VOXELS`
+  (16 M ≈ 32 MB in the phone's memory) it resamples by **area mean with a
+  spacing floor** (`_plan_resample` + `_Resampler`, same code for the DICOM
+  path — slice by slice while decoding — and the NRRD path): find the smallest
+  spacing s that fits, bring only the axes finer than s to s (factors need not
+  be integers; box weights, rows sum to 1), leave coarser axes alone. Tied
+  axes shrink together, so the in-plane pixel stays square — the old rule
+  halved only the first of two equal axes and left a real CT at 1.48 × 0.74 mm.
+  The new voxel b sits at b·f + (f−1)/2 in old index units, so the origin
+  moves (f−1)/2 old voxels; `ExamStats.downsample` is the float factor per axis. `ExamStats.label`
+  = the SeriesDescription through `clean_label` (control chars and `\0`
+  padding out, spaces collapsed, ≤ 64 chars; `None` if empty) or, for a NRRD,
+  the file name without extension.
+- **Canonical output, per series n:** `cases/{uid}.exam-{n}.nrrd` — gzip NRRD
+  with only `type, dimension, space: left-posterior-superior, sizes, space
+  directions, kinds, endian, encoding, space origin` — and then
+  `cases/{uid}.exam-{n}.json` = `{version: 1, label, images, shape, spacing,
+  bytes}` (no `modality`: the label is the only header field made public) (`_store_exam_series`: NRRD first; the JSON is what makes the
+  series exist for the viewer, so a NRRD left without JSON by a failure between
+  the two puts is invisible and gets overwritten on retry). NRRD input in
+  RAS/LAS is converted to LPS; every custom key/value is dropped. The whole
+  DICOM header is left behind — **anonymization by construction** — **except
+  the series label** (user decision, 2026-09-26: the SeriesDescription as it
+  came, only cleaned). The pixels themselves (a face in a head CT) still need
+  access control — Sprint 4. Array order is `(k, j, i)` in C order, written
+  with `index_order="C"` so `sizes` and `space directions` are both `i j k`;
+  `test_exam.py` has the transposition test for this.
+- **Order in `/upload`:** normalize the exam first (an input error → 400 before
+  anything is published: no orphan GLB, no Sketchfab slot spent) → meshes →
+  Sketchfab + R2 GLB (if there are meshes) → R2 series 0. The series-0 put is
+  best-effort like the GLB: `exam.stored: false` + `exam.error` and
+  `write_token: null` (no extra series without series 0). Without a model the
+  exam *is* the case: failure → 502.
+- **Exam-only case:** no GLB, no Sketchfab; uid = `secrets.token_hex(16)`,
+  `processing: false` (the upload page skips polling), `stats: null`.
+- **Response** (`exam` in `/upload`; the whole body of `/cases/{uid}/exam` is
+  `{uid, exam}`): `exam: null | {stored, index, label, source, shape, spacing,
+  downsample, size_mb, ignored_files, modality, error?}`. The viewer does not
+  use it — it finds the series by `GET cases/{uid}.exam-{n}.json`.
+- **Endpoints are plain `def`** (FastAPI runs them in a threadpool): decoding a
+  JPEG2000 series and gzipping takes seconds and would otherwise block the event
+  loop (`/status`, `/health`).
+- **Decoders:** `pydicom` + `pylibjpeg`, `pylibjpeg-libjpeg`, `pylibjpeg-openjpeg`,
+  `pylibjpeg-rle` (compressed series from PACS; cp312 wheels, nothing to
+  compile). No `python-gdcm`.
+- **Future (asked by the user):** a segmentation NRRD (labelmap) becoming 3D
+  structures via marching cubes. Today NRRD/DICOM is image only.
+
 ### Required: force vertex-normal compute after transforms
 
 `apply_transform` invalidates trimesh's cached normals. The GLB exporter only writes the `NORMAL` attribute if normals exist on the mesh at export time. Without `NORMAL`, viewers render flat-shaded (visible triangle facets).
@@ -184,6 +294,7 @@ OBJ bundles reject `boolean_ops` with a 400.
 
 ### Input limits
 
+- **Image exam: per request 200 MB / 900 loose files / one series; 4 series per case; 16 M voxels per series after downsampling.** See "Image exam" above.
 - **Max STL size: 60MB.** Set in `main.py`. STLs larger than this should not exist in our pipeline (segmentation output is capped upstream). If they do, fail loudly — silently truncating clinical data is dangerous.
 - **STL only for now.** OBJ/PLY/etc. could be added but are not in scope.
 
@@ -244,7 +355,8 @@ Only `https://biodesignlab.com.br` and the four local Live Server variants (`htt
 
 The `DRY_RUN=true` env var short-circuits **both** effectful clients:
 - `sketchfab.upload_model` / `sketchfab.get_status` return a known-working Sketchfab UID by default (configurable via `DRY_RUN_UID` env), so the resulting `viewer_url` actually resolves in the browser.
-- `r2.upload_glb` logs `[r2 DRY_RUN] upload '<key>' (<bytes>) -> bucket=<bucket>` and returns without calling the R2 API.
+- `r2.upload_glb` / `r2.upload_exam` / `r2.upload_exam_meta` log `[r2 DRY_RUN] upload '<key>' (<bytes>) -> bucket=<bucket>` and return without calling the R2 API. With `DRY_RUN_GLB_DIR` set (name kept from when only the GLB existed) the objects are written to `<dir>/cases/{uid}.glb` and `<dir>/cases/{uid}.exam-{n}.nrrd|.json`, which the local viewer opens before trying R2.
+- `EXAM_WRITE_SECRET` falls back to a fixed dev-only value, so write tokens work locally without configuration.
 
 That's enough to exercise the upload page, CORS, and the full UX loop end-to-end without burning slots or R2 ops.
 
@@ -271,7 +383,7 @@ The canonical, cross-service version of this roadmap lives in the workspace-leve
 
 ## What this service is NOT responsible for
 
-- DICOM parsing or AI segmentation (separate service, not built yet).
+- AI segmentation (separate service, not built yet). DICOM *normalization* to the canonical NRRD does live here (`exam.py`), because it is storage preparation for the viewer, not analysis.
 - Authentication or user accounts (out of scope; unguessable Sketchfab UIDs are the access control for now).
 - Storing case metadata (patient name, exam date, etc.) — when this is needed, add a Postgres on Railway and a separate `cases` service. Do not bolt it onto this one.
 - Frontend rendering / Three.js / measurement tools (lives in the `medCaseViewer` repo).
