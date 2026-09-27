@@ -3,8 +3,8 @@
 Knows nothing about meshes or exams; only object storage. Takes bytes + uid,
 writes to cases/{uid}.glb (model) and, per image-exam series n (0 = the one the
 structures were segmented on), cases/{uid}.exam-{n}.nrrd + cases/{uid}.exam-{n}.json.
-Sprint 2 destination — runs in parallel with sketchfab.upload_model so we
-start owning the GLBs ourselves.
+Added in Sprint 2 as a backup next to Sketchfab; the only destination since
+Sprint 3c.
 
 DRY_RUN=true short-circuits the real API — useful for local dev so we
 don't spend ops budget on iterations, and lets the service boot without

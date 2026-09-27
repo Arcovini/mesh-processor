@@ -1,8 +1,8 @@
-"""FastAPI app — orchestrates multi-STL upload, mesh processing and Sketchfab publishing.
+"""FastAPI app — orchestrates multi-STL upload, mesh processing and storage.
 
 Reads env, validates on startup, exposes 3 endpoints, handles CORS.
 All mesh work is delegated to processor.py; the image exam (DICOM/NRRD) to
-exam.py; all Sketchfab work to sketchfab.py; storage to r2.py.
+exam.py; storage to r2.py (the only destination since Sprint 3c).
 This module is pure orchestration.
 """
 from __future__ import annotations
@@ -16,7 +16,6 @@ import re
 import secrets
 import unicodedata
 import zipfile
-from datetime import date
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,17 +28,12 @@ from processor import (
     process_stls,
 )
 from r2 import R2Error, upload_exam, upload_exam_meta, upload_glb
-from sketchfab import SketchfabError, get_status, upload_model
 
 # Accepted texture extensions inside an OBJ bundle. Most photogrammetry exports
 # use JPG (smaller); PNG is here because Three.js MTLLoader-style tools sometimes
 # emit it. Anything else is treated as junk (e.g. a stray .DS_Store inside a zip).
 _TEXTURE_EXTS = {".jpg", ".jpeg", ".png"}
 
-
-def _auto_sketchfab_name() -> str:
-    """YYYY-MM-DD-<12 random digits>. Placeholder id until the DB layer lands."""
-    return f"{date.today().isoformat()}-{secrets.randbelow(10**12):012d}"
 
 MAX_TOTAL_BYTES = 60 * 1024 * 1024  # 60 MB across all mesh files in one request
 
@@ -139,7 +133,7 @@ def _longest_common_suffix(strings: list[str]) -> str:
 
 
 def _transliterate(s: str) -> str:
-    """ASCII-ize — Sketchfab/glTF node names with accents (ã, ç) render as mojibake."""
+    """ASCII-ize — glTF node names with accents (ã, ç) rendered as mojibake on Sketchfab."""
     return "".join(
         c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c)
     )
@@ -168,7 +162,6 @@ def clean_mesh_names(filenames: list[str | None]) -> list[str]:
     return cleaned
 
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in ("true", "1", "yes")
-SKETCHFAB_TOKEN = os.getenv("SKETCHFAB_TOKEN", "")
 VIEWER_BASE = os.getenv("VIEWER_BASE", "https://biodesignlab.com.br/case/")
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
@@ -186,7 +179,6 @@ EXAM_WRITE_SECRET = os.getenv("EXAM_WRITE_SECRET", "") or (
 
 if not DRY_RUN:
     _required = {
-        "SKETCHFAB_TOKEN": SKETCHFAB_TOKEN,
         "R2_ACCOUNT_ID": R2_ACCOUNT_ID,
         "R2_ACCESS_KEY_ID": R2_ACCESS_KEY_ID,
         "R2_SECRET_ACCESS_KEY": R2_SECRET_ACCESS_KEY,
@@ -355,8 +347,7 @@ def _process_meshes(
 def _normalize_exam(exam: list[UploadFile]) -> tuple[bytes, ExamStats]:
     """Campo `exam` → NRRD canônico (exam.py). Erro de entrada → 400/413.
 
-    Roda ANTES de qualquer upload: um exame recusado não deixa GLB órfão no
-    R2 nem modelo criado à toa no Sketchfab.
+    Roda ANTES de qualquer upload: um exame recusado não deixa GLB órfão no R2.
     """
     if len(exam) > MAX_EXAM_FILES:
         raise HTTPException(
@@ -443,7 +434,7 @@ def _log_exam(stats: ExamStats) -> None:
 # `def` (e não `async def`): o FastAPI roda a função num thread pool. O
 # processamento é CPU pura (decimação, divisões, decodificar e comprimir o
 # exame — dezenas de segundos numa série grande); num `async def` isso travaria
-# o event loop e o /status e o /health parariam de responder durante o upload.
+# o event loop e o /health pararia de responder durante o upload.
 @app.post("/upload")
 def upload(
     files: list[UploadFile] = File(default=[]),
@@ -475,28 +466,20 @@ def upload(
 
     r2 = _r2()
 
-    # 3) Destinos. Com modelo, o uid ainda é o do Sketchfab (fonte da verdade
-    #    até o Sprint 3c). Caso só com exame nunca toca o Sketchfab: o uid é
-    #    nosso, e o visualizador acha o exame pelo cases/{uid}.exam-0.json.
-    sketchfab_name: str | None = None
+    # 3) Destino. Desde o Sprint 3c o R2 é o único lugar do modelo (o Sketchfab
+    #    só serve, como leitura, os casos antigos): o uid é nosso, e sem o GLB
+    #    gravado o link abriria "caso não encontrado" — então o request falha.
+    #    O visualizador acha o exame pelo cases/{uid}.exam-0.json.
+    uid = secrets.token_hex(16)
     if glb_bytes is not None:
-        sketchfab_name = _auto_sketchfab_name()
-        try:
-            uid = upload_model(glb_bytes, name=sketchfab_name, token=SKETCHFAB_TOKEN)
-        except SketchfabError as e:
-            raise HTTPException(502, str(e))
-
-        # Best-effort parallel push to R2. Sketchfab is the source of truth in
-        # Sprint 2; R2 is a backup that Sprint 3 will migrate the viewer to.
-        # Failures here log loudly but do not break the request — the clinician
-        # already has a working viewer link via Sketchfab.
         try:
             upload_glb(glb_bytes, uid=uid, **r2)
             print(f"[r2] uploaded cases/{uid}.glb")
         except R2Error as e:
             print(f"[r2 ERROR] failed cases/{uid}.glb: {e}")
-    else:
-        uid = secrets.token_hex(16)
+            raise HTTPException(
+                502, "Não foi possível guardar o modelo agora. Tente enviar de novo."
+            )
 
     # A série do /upload é sempre a 0: a que as estruturas usaram (a página
     # manda primeiro a que o clínico marcou como "usada na segmentação").
@@ -504,7 +487,7 @@ def upload(
     write_token: str | None = None
     if exam_bytes is not None and exam_stats is not None:
         exam_info = _exam_info(exam_stats, 0)
-        # Falha de infraestrutura no exame. Com modelo: best-effort, como o GLB —
+        # Falha de infraestrutura no exame. Com modelo: best-effort —
         # o link do caso continua valendo e a resposta diz que o exame não foi
         # guardado. Sem modelo o exame É o caso: sem ele o link abriria
         # "caso não encontrado", então o request falha.
@@ -524,7 +507,6 @@ def upload(
     return {
         "uid": uid,
         "viewer_url": f"{VIEWER_BASE}?id={uid}",
-        "sketchfab_name": sketchfab_name,
         "stats": (
             {
                 "total_input_triangles": stats.total_input_triangles,
@@ -548,9 +530,10 @@ def upload(
         # Autoriza POST /cases/{uid}/exam (séries 1..3). A página guarda só na
         # memória; None quando o caso não tem exame gravado.
         "write_token": write_token,
-        # Só o Sketchfab processa depois da resposta. Sem modelo não há nada a
-        # esperar e a página de upload vai direto para o link.
-        "processing": glb_bytes is not None,
+        # Nada processa depois da resposta desde o Sprint 3c. Fica por
+        # compatibilidade: a página de antes do 3c consultava o /status (que
+        # não existe mais) a menos que viesse `processing: false`.
+        "processing": False,
     }
 
 
@@ -588,10 +571,3 @@ def add_exam_series(
         )
     return {"uid": uid, "exam": info}
 
-
-@app.get("/status/{uid}")
-def status(uid: str) -> dict:
-    try:
-        return get_status(uid, token=SKETCHFAB_TOKEN)
-    except SketchfabError as e:
-        raise HTTPException(502, str(e))

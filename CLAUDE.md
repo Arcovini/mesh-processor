@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `mesh-processor` is the backend service for **medCaseViewer** (https://biodesignlab.com.br) — a 3D surgical planning tool for the Brazilian healthcare market.
 
-Its single responsibility: receive raw STL files (typically generated from medical imaging segmentation), optimize them for web viewing, and publish them to Sketchfab so they can be loaded by the existing static viewer at `https://biodesignlab.com.br/case/?id=<UID>`.
+Its single responsibility: receive raw STL files (typically generated from medical imaging segmentation), optimize them for web viewing, and store them in Cloudflare R2, where the viewer at `https://biodesignlab.com.br/case/?id=<UID>` loads them — along with the case's image exam, if any (see "Image exam").
 
-This service was built in **Sprint 1** (Sketchfab as the only destination) and extended in **Sprint 2** (parallel push to Cloudflare R2). See "Roadmap" below — design decisions here exist to make Sprint 3 (viewer migration off Sketchfab) painless. Do not collapse abstractions that exist for that reason.
+This service was built in **Sprint 1** (Sketchfab as the only destination), extended in **Sprint 2** (parallel push to Cloudflare R2) and **Sprint 3d** (image exam). Since **Sprint 3c** (2026-09-27) R2 is the only destination: nothing is written to Sketchfab anymore. See "Roadmap" below.
 
 A single `/upload` request accepts **multiple STLs** at once (one clinical case = N anatomical structures) and produces **one** GLB containing each STL as a named mesh node. The viewer's `getNodeMap` uses those names to render per-structure toggles and opacity sliders.
 
@@ -19,7 +19,7 @@ A single `/upload` request accepts **multiple STLs** at once (one clinical case 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then fill in SKETCHFAB_TOKEN (or set DRY_RUN=true)
+cp .env.example .env   # then fill in the R2 credentials and EXAM_WRITE_SECRET (or set DRY_RUN=true)
 set -a && source .env && set +a
 uvicorn main:app --reload --port 8000
 ```
@@ -49,7 +49,7 @@ curl -X POST http://localhost:8000/upload \
   -F "files=@kidney.stl"
 ```
 
-The `name` form field **does not exist** — the model name on Sketchfab is auto-generated as `YYYY-MM-DD-<12 random digits>`, a placeholder identifier until a DB layer is introduced. The original STL filenames are cleaned (see `clean_mesh_names` in `main.py`) and become the GLB node names that the viewer displays as toggle labels.
+The `name` form field **does not exist** — the case uid is minted here (`secrets.token_hex(16)`, 32 hex chars, the same shape the Sketchfab uids had). The original STL filenames are cleaned (see `clean_mesh_names` in `main.py`) and become the GLB node names that the viewer displays as toggle labels.
 
 ### Building/running with Docker
 
@@ -63,7 +63,6 @@ The Dockerfile installs `build-essential` because `fast-simplification` compiles
 ### Deployment
 
 Hosted on Railway **transitionally**. Push to `main` triggers auto-deploy. Railway auto-detects the Dockerfile and uses it. Required env vars (set in the Railway dashboard):
-- `SKETCHFAB_TOKEN` — Sketchfab API token (secret)
 - `R2_ACCOUNT_ID` — Cloudflare account identifier (secret-ish; non-authenticating but unique to the account)
 - `R2_ACCESS_KEY_ID` — R2 token Access Key (secret)
 - `R2_SECRET_ACCESS_KEY` — R2 token Secret (secret)
@@ -71,7 +70,7 @@ Hosted on Railway **transitionally**. Push to `main` triggers auto-deploy. Railw
 - `VIEWER_BASE` — defaults to `https://biodesignlab.com.br/case/`
 - `EXAM_WRITE_SECRET` — signs the `write_token` that lets the upload page add exam series 1..3 to a case (secret; any long random string — rotating it only breaks uploads in progress). Set it via Railway's Raw Editor.
 - `PORT` — set automatically by Railway
-- `DRY_RUN` — leave unset (or `false`) in production. Boot fails loudly if any of the SKETCHFAB / R2 secrets or `EXAM_WRITE_SECRET` are missing while DRY_RUN is off, by design.
+- `DRY_RUN` — leave unset (or `false`) in production. Boot fails loudly if any of the R2 secrets or `EXAM_WRITE_SECRET` are missing while DRY_RUN is off, by design. (`SKETCHFAB_TOKEN` is no longer read since Sprint 3c.)
 
 **Future host: Google Cloud Run** when migration triggers fire (LGPD pressure, GPU need for Sprint 4+, or cost crossover). Because this service runs entirely from `Dockerfile` with env vars at the edges, the migration is primarily learning `gcloud` CLI and re-setting env vars in the target dashboard. See the workspace-level `CLAUDE.md` for the full hosting strategy and triggers.
 
@@ -81,16 +80,15 @@ Hosted on Railway **transitionally**. Push to `main` triggers auto-deploy. Railw
 
 ```
 mesh-processor/
-├── main.py          # FastAPI app — /upload, /cases/{uid}/exam, /status, /health. Pure orchestration.
+├── main.py          # FastAPI app — /upload, /cases/{uid}/exam, /health. Pure orchestration.
 ├── processor.py     # STL(s) → scene → multi-mesh GLB (pure, testable, no I/O)
-├── sketchfab.py     # Sketchfab API client. Thin. DRY_RUN short-circuit inside.
 ├── r2.py            # Cloudflare R2 client (S3-compatible via boto3). Thin. DRY_RUN short-circuit inside.
 ├── exam.py          # Image exam (DICOM series / zip / NRRD) → canonical NRRD (pure, no I/O)
 ├── test_exam.py, test_upload_exam.py  # pytest: exam.py and the `exam` field end to end
 ├── scripts/nrrd_to_stl.py  # dev only: marching-cubes STL from a NRRD + the sphere test pair (and its 2nd series)
 ├── scripts/upload_fixtures.py  # dev only: the multi-series DICOM fixtures of medCaseViewer/tests/upload
 ├── test_processor.py  # Informal smoke test against real STLs (not pytest)
-├── .env.example     # Template for SKETCHFAB_TOKEN, VIEWER_BASE, R2_*, DRY_RUN
+├── .env.example     # Template for VIEWER_BASE, R2_*, EXAM_WRITE_SECRET, DRY_RUN
 ├── Dockerfile
 ├── .dockerignore
 └── requirements.txt
@@ -98,17 +96,17 @@ mesh-processor/
 
 ### Critical separation: processor vs destination
 
-`processor.py` knows nothing about Sketchfab or R2. `sketchfab.py` and `r2.py` know nothing about meshes. This is intentional. Sprint 2 added `r2.py` as a sibling to `sketchfab.py` to upload to Cloudflare R2 in parallel; Sprint 3 will remove Sketchfab entirely. **Do not couple them.**
+`processor.py` knows nothing about R2. `r2.py` knows nothing about meshes. This is intentional, and it has paid off twice: Sprint 2 added `r2.py` as a sibling to `sketchfab.py` with zero processor changes, and Sprint 3c deleted `sketchfab.py` touching only `main.py`'s orchestration. **Do not couple them.**
 
-The same separation pays off: `processor.py` returns `bytes`, not a file path. Those bytes go to **two** destinations simultaneously (Sketchfab + R2) with zero processor changes. Keeping intermediates in memory costs ~10MB per request and saves the duplication.
+For the same reason `processor.py` returns `bytes`, not a file path: where the bytes go is the caller's business. Keeping intermediates in memory costs ~10MB per request.
 
 ### Pure vs effectful split
 
 `processor.py` is a **pure** module — `bytes in → bytes out`, no I/O, no env vars, no network. Call it 1000 times with the same input and it returns the same output. Testable without any setup.
 
-`sketchfab.py` and `r2.py` are **effectful** — they mutate the world (create Sketchfab models / write R2 objects, consume quota and ops). That's why both have a DRY_RUN short-circuit: we want to exercise every layer above them (endpoint, CORS, the upload page, parallel orchestration in `main.py`) without actually triggering effects until we're ready.
+`r2.py` is **effectful** — it mutates the world (writes R2 objects, consumes ops). That's why it has a DRY_RUN short-circuit: we want to exercise every layer above it (endpoint, CORS, the upload page, orchestration in `main.py`) without actually triggering effects until we're ready. (`sketchfab.py` followed the same rule until Sprint 3c deleted it.)
 
-The rule: separate computation from side effects at file boundaries. Testing the pure part is free; testing the effectful parts costs slots/dollars/time and should be done sparingly.
+The rule: separate computation from side effects at file boundaries. Testing the pure part is free; testing the effectful parts costs dollars/time and should be done sparingly.
 
 ### Mesh processing decisions (medical context)
 
@@ -118,8 +116,8 @@ These defaults exist because this is **medical/surgical data**, not generic 3D c
 - **Decimation algorithm: `fast_simplification` (quadric edge collapse).** Chosen over `pymeshlab` (heavy install, GPL) and `trimesh.simplify_quadric_decimation` (slower, less stable on large meshes).
 - **No aggressive smoothing.** `trimesh.load(process=True)` does safe cleanup (duplicate vertices, normals). Anything more (Laplacian smoothing, Taubin) can round off clinically relevant features and is **off by default**. If a future request needs it, gate it behind an explicit flag, not a default.
 - **Coordinate system: STL is patient space, Z-up (LPS, the 3D Slicer default); glTF is Y-up.** We apply a fixed `-π/2` rotation around X so each mesh lands upright in the viewer (`_RAS_TO_GLTF` — the name is historical; no x/y sign flip happens, so the GLB is **LPS rotated**). The rotation is identical for every mesh in a batch, preserving inter-structure spatial relationships (a kidney, its artery, its vein, and a lesion from the same exam stay co-registered). An STL whose 80-byte header says `SPACE=RAS` (Slicer writes `SPACE=LPS` or `SPACE=RAS` there) is first rotated 180° about S (`diag(-1,-1,1)`) to LPS. The viewer applies the same rotation to the image exam (`medCaseViewer/case/exam-geom.js`) — **change both or neither**.
-- **Output format: GLB binary.** Smaller than glTF+bin, single file, native browser support. Sketchfab's preferred format.
-- **Per-mesh PBR materials, not vertex colors.** Each structure gets a named `PBRMaterial` (`baseColorFactor` + `roughnessFactor=0.5` + `metallicFactor=0`). Reason: Sketchfab's viewer API (`api.setMaterial`) operates on the *material list*. Without distinct materials, the viewer's opacity slider per structure cannot function. Vertex colors would render visually but would be a single material in the viewer.
+- **Output format: GLB binary.** Smaller than glTF+bin, single file, native browser support; Three.js `GLTFLoader` reads it directly.
+- **Per-mesh PBR materials, not vertex colors.** Each structure gets a named `PBRMaterial` (`baseColorFactor` + `roughnessFactor=0.5` + `metallicFactor=0`). Reason: the viewer's per-structure opacity and color work on each structure's material (the legacy Sketchfab viewer's `api.setMaterial` also worked on the *material list*). Without distinct materials, the opacity slider per structure cannot function. Vertex colors would render visually but would be a single material in the viewer.
 
 ### Color assignment (keyword-based with colorblind-safe fallback)
 
@@ -264,20 +262,20 @@ structures only, exam only, or both.
   with `index_order="C"` so `sizes` and `space directions` are both `i j k`;
   `test_exam.py` has the transposition test for this.
 - **Order in `/upload`:** normalize the exam first (an input error → 400 before
-  anything is published: no orphan GLB, no Sketchfab slot spent) → meshes →
-  Sketchfab + R2 GLB (if there are meshes) → R2 series 0. The series-0 put is
-  best-effort like the GLB: `exam.stored: false` + `exam.error` and
+  anything is published: no orphan GLB) → meshes → R2 GLB (if there are
+  meshes; failure → 502, see R2 notes) → R2 series 0. With a model the series-0
+  put is best-effort: `exam.stored: false` + `exam.error` and
   `write_token: null` (no extra series without series 0). Without a model the
   exam *is* the case: failure → 502.
-- **Exam-only case:** no GLB, no Sketchfab; uid = `secrets.token_hex(16)`,
-  `processing: false` (the upload page skips polling), `stats: null`.
+- **Exam-only case:** no GLB; `stats: null`. Like every case, uid =
+  `secrets.token_hex(16)` and `processing: false`.
 - **Response** (`exam` in `/upload`; the whole body of `/cases/{uid}/exam` is
   `{uid, exam}`): `exam: null | {stored, index, label, source, shape, spacing,
   downsample, size_mb, ignored_files, modality, error?}`. The viewer does not
   use it — it finds the series by `GET cases/{uid}.exam-{n}.json`.
 - **Endpoints are plain `def`** (FastAPI runs them in a threadpool): decoding a
   JPEG2000 series and gzipping takes seconds and would otherwise block the event
-  loop (`/status`, `/health`).
+  loop (`/health`).
 - **Decoders:** `pydicom` + `pylibjpeg`, `pylibjpeg-libjpeg`, `pylibjpeg-openjpeg`,
   `pylibjpeg-rle` (compressed series from PACS; cp312 wheels, nothing to
   compile). No `python-gdcm`.
@@ -298,45 +296,27 @@ structures only, exam only, or both.
 - **Max STL size: 60MB.** Set in `main.py`. STLs larger than this should not exist in our pipeline (segmentation output is capped upstream). If they do, fail loudly — silently truncating clinical data is dangerous.
 - **STL only for now.** OBJ/PLY/etc. could be added but are not in scope.
 
-### Sketchfab integration notes
+### Sketchfab (removed in Sprint 3c)
 
-- Upload returns a `uid` immediately, but processing on Sketchfab's side takes 30-90s for large models (<5s for small multi-mesh cases). The frontend polls `/status/{uid}` until it returns `ready: true`.
-- Always include `'source': 'biodesignlab'` per Sketchfab's developer guidelines (they use it for internal tracking).
-- API token is account-wide — never expose it to the frontend. All Sketchfab calls go through this service.
-- Sketchfab plan file-size limits: Basic 100MB/file, Pro 200MB, Premium 500MB. Our 60MB cap stays well below.
-
-**Monthly upload cap bypass via `isDownloadable=true`.** Sketchfab's pricing page states: *"A model that is downloadable doesn't count against this limit."* Setting `isDownloadable: "true"` on the upload means the model does not consume one of the Basic plan's 10 monthly slots. biodesignlab is on the Basic (free) tier; without this flag, ~10 clinical cases per month would exhaust the account. **Trade-off:** anyone with the model's URL can download the GLB. For biodesignlab this is acceptable because segmented anatomical STLs contain no PHI. If ever storing identifiable data, revisit.
-
-**Working upload field names** (confirmed by real upload on 2026-04-23):
-
-| Form field | Value | Notes |
-|---|---|---|
-| `modelFile` | `(filename, bytes, "model/gltf-binary")` | Multipart file. Field name is *exactly* `modelFile` — not `file`. |
-| `name` | auto-generated `YYYY-MM-DD-<12 random digits>` | Model name on sketchfab.com |
-| `source` | `"biodesignlab"` | per Sketchfab dev guidelines |
-| `isPublished` | `"true"` | string, not bool |
-| `private` | `"false"` | Basic plan can't do private anyway; we keep it explicit |
-| `isDownloadable` | `"true"` | **critical** — bypasses the 10/mo cap |
-
-Response on 201 Created: `{"uid": "..."}`. Status endpoint response: `status.processing` is `SUCCEEDED` when ready.
+Until 2026-09-27 every model was also uploaded to Sketchfab (`sketchfab.py`, `isDownloadable=true` to stay out of the Basic plan's 10/month cap) and the upload page polled `GET /status/{uid}` until Sketchfab finished processing. Both are gone: nothing in this service reads `SKETCHFAB_TOKEN` or calls the Sketchfab API. The ~100 cases created before Sprint 2 live only on Sketchfab (several on collaborators' accounts); the viewer opens them read-only through `/case/legacy/`, and the account stays alive at $0, never written to. The client and its field names (confirmed by a real upload on 2026-04-23) are in git history, before the Sprint 3c commit.
 
 ### Cloudflare R2 integration notes
 
 R2 is the parallel storage backend added in Sprint 2. Why R2 (and not S3/GCS) lives in the workspace-level `CLAUDE.md` under "Hosting strategy" — short version: zero egress cost on Cloudflare's network, S3-compatible API so the SDK is just `boto3` pointed at a different `endpoint_url`, and a generous always-free tier (10GB storage, 1M Class A ops/month, 10M Class B ops/month).
 
-**Object key convention:** `cases/{uid}.glb`. Same UID as the Sketchfab one for now (in Sprint 3 we may mint our own UIDs once Sketchfab is gone). The `cases/` prefix exists so the bucket can later host non-case objects (thumbnails, JSON metadata, exports) without name collisions.
+**Object key convention:** `cases/{uid}.glb`, uid = `secrets.token_hex(16)` minted by `main.py` (until Sprint 3c it was the Sketchfab uid — also 32 hex chars, so the viewer URL contract did not change). The `cases/` prefix exists so the bucket can later host non-case objects (thumbnails, JSON metadata, exports) without name collisions.
 
-**Failure semantics: best-effort.** `main.py` calls `r2.upload_glb(...)` *after* the Sketchfab upload succeeds, inside a `try/except R2Error` that logs `[r2 ERROR] ...` and continues. The clinician's request still returns 200 — Sketchfab is the source of truth in Sprint 2 and the viewer URL works regardless of R2. Rationale: R2 is a backup whose absence does not block the clinical workflow today. Sprint 3 will tighten this when the viewer starts reading from R2 directly.
+**Failure semantics: the GLB put is mandatory.** R2 is the only copy of the model since Sprint 3c, so an `R2Error` on `cases/{uid}.glb` logs `[r2 ERROR] ...` and the request fails with 502 "Não foi possível guardar o modelo agora. Tente enviar de novo." — a 200 would hand the clinician a link that opens "caso não encontrado". (In Sprint 2 this was best-effort, because Sketchfab held the copy the viewer used.) The exam's series 0 is still best-effort when the case has a model — see "Image exam".
 
-**Token scope (least privilege).** The R2 token used in production has permission "Object Read & Write" scoped to the single bucket `clinical-3d`. It cannot list, create, or delete buckets, and cannot touch other buckets in the account. If the token leaks, the blast radius is bounded to objects within `clinical-3d` (which we can re-upload from Sketchfab anyway).
+**Token scope (least privilege).** The R2 token used in production has permission "Object Read & Write" scoped to the single bucket `clinical-3d`. It cannot list, create, or delete buckets, and cannot touch other buckets in the account. If the token leaks, the blast radius is bounded to objects within `clinical-3d`.
 
 **Endpoint URL is derived, not configured.** `r2.py` builds `https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com` from the account id. This is the default (auto/global) R2 endpoint — works because we picked "Localização: Automática" at bucket creation time. If a future bucket uses jurisdictional restriction (EU, FedRAMP), the endpoint format changes and this assumption breaks.
 
 **`region_name="auto"`.** R2 has no real regions, but `boto3` requires `region_name` to construct request signatures. Cloudflare accepts `"auto"` (canonical) or any AWS-region-like string. Don't change this without a reason.
 
-**`ContentType="model/gltf-binary"`.** Set on every put. Important for Sprint 3 — when the viewer fetches `cases/{uid}.glb` over HTTP, the browser uses Content-Type to route the bytes to the right loader. Wrong Content-Type now = bug deferred to Sprint 3.
+**`ContentType="model/gltf-binary"`.** Set on every put. The viewer fetches `cases/{uid}.glb` over HTTP, and the browser uses Content-Type to route the bytes to the right loader.
 
-**No retries in `r2.py`.** Same thin-client rule as `sketchfab.py`: HTTP + response parsing, nothing else. boto3's default retry behavior is left in place (it handles transient 503s with backoff internally), but we add no retry loops of our own. If we later observe lots of transient failures and want explicit retry policy, add it in `main.py` orchestration, not in the client.
+**No retries in `r2.py`.** Thin-client rule: HTTP + response parsing, nothing else. boto3's default retry behavior is left in place (it handles transient 503s with backoff internally), but we add no retry loops of our own. If we later observe lots of transient failures and want explicit retry policy, add it in `main.py` orchestration, not in the client.
 
 ### CORS
 
@@ -346,23 +326,22 @@ Only `https://biodesignlab.com.br` and the four local Live Server variants (`htt
 
 - **FastAPI with type hints.** Use `Form()`, `UploadFile`, and Pydantic models for request validation. Return plain dicts for responses (FastAPI handles serialization).
 - **Errors as HTTPException with clear messages.** The frontend surfaces these directly to clinicians, so keep them human-readable in Portuguese where user-facing. Ex: `raise HTTPException(400, "STL inválido ou corrompido: ...")`.
-- **No background workers / queues yet.** Processing happens synchronously in the request. Multi-STL cases process in <1s plus the Sketchfab upload RTT (~1-2s). If we add larger inputs or batch processing, revisit with Celery + Redis.
-- **Stateless service.** No database. Sketchfab remains the source of truth for uploaded models in Sprint 2; R2 is the parallel backup. Still no DB until metadata requirements appear.
+- **No background workers / queues yet.** Processing happens synchronously in the request. Multi-STL cases process in <1s plus the R2 put. If we add larger inputs or batch processing, revisit with Celery + Redis.
+- **Stateless service.** No database. R2 keys are the only state (`cases/{uid}.*`). Still no DB until metadata requirements appear.
 - **Pure functions in `processor.py`.** Takes bytes, returns bytes + stats. No I/O, no env vars. Makes it trivially testable and reusable.
-- **Thin clients** (`sketchfab.py` and `r2.py`, both following the same shape). Only HTTP + response parsing. No retry loops, no caching, no polling. Orchestration (retry, concurrency, cross-destination logic, failure tolerance) lives in `main.py`. A thin client is cheap to delete when Sprint 3 removes Sketchfab.
+- **Thin clients** (`r2.py`; `sketchfab.py` had the same shape until Sprint 3c). Only HTTP + response parsing. No retry loops, no caching, no polling. Orchestration (retry, concurrency, cross-destination logic, failure tolerance) lives in `main.py`. That is what made Sprint 3c cheap: deleting `sketchfab.py` touched only `main.py`.
 
 ### DRY_RUN pattern
 
-The `DRY_RUN=true` env var short-circuits **both** effectful clients:
-- `sketchfab.upload_model` / `sketchfab.get_status` return a known-working Sketchfab UID by default (configurable via `DRY_RUN_UID` env), so the resulting `viewer_url` actually resolves in the browser.
-- `r2.upload_glb` / `r2.upload_exam` / `r2.upload_exam_meta` log `[r2 DRY_RUN] upload '<key>' (<bytes>) -> bucket=<bucket>` and return without calling the R2 API. With `DRY_RUN_GLB_DIR` set (name kept from when only the GLB existed) the objects are written to `<dir>/cases/{uid}.glb` and `<dir>/cases/{uid}.exam-{n}.nrrd|.json`, which the local viewer opens before trying R2.
+The `DRY_RUN=true` env var short-circuits the effectful client:
+- `r2.upload_glb` / `r2.upload_exam` / `r2.upload_exam_meta` log `[r2 DRY_RUN] upload '<key>' (<bytes>) -> bucket=<bucket>` and return without calling the R2 API. With `DRY_RUN_GLB_DIR` set (name kept from when only the GLB existed) the objects are written to `<dir>/cases/{uid}.glb` and `<dir>/cases/{uid}.exam-{n}.nrrd|.json`, which the local viewer opens before trying R2 (the uid is random in DRY_RUN too, so without `DRY_RUN_GLB_DIR` the returned `viewer_url` opens "caso não encontrado"; the workspace launch config `mesh-processor-dry` sets it to the viewer root).
 - `EXAM_WRITE_SECRET` falls back to a fixed dev-only value, so write tokens work locally without configuration.
 
-That's enough to exercise the upload page, CORS, and the full UX loop end-to-end without burning slots or R2 ops.
+That's enough to exercise the upload page, CORS, and the full UX loop end-to-end without spending R2 ops.
 
-`DRY_RUN=true` also lets the service boot without **any** of `SKETCHFAB_TOKEN`, `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, or `R2_SECRET_ACCESS_KEY` — useful for CI and for hand-off to new contributors who don't have credentials yet. Production must never set `DRY_RUN=true`.
+`DRY_RUN=true` also lets the service boot without **any** of `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` or `EXAM_WRITE_SECRET` — useful for CI and for hand-off to new contributors who don't have credentials yet. Production must never set `DRY_RUN=true`.
 
-The fake/real paths living in the same file is deliberate: if a real API's shape changes (Sketchfab response format, R2 endpoint URL convention, etc.), the DRY_RUN branch is right there, a few lines away, and gets updated in the same diff. A separate mock file would drift silently.
+The fake/real paths living in the same file is deliberate: if a real API's shape changes (R2 endpoint URL convention, etc.), the DRY_RUN branch is right there, a few lines away, and gets updated in the same diff. A separate mock file would drift silently.
 
 ### Error handling inside `processor.py`
 
@@ -376,7 +355,8 @@ Transitive deps worth knowing about:
 
 - **Sprint 1 ✅:** STL → optimized GLB → Sketchfab. Viewer URL pattern unchanged.
 - **Sprint 2 ✅:** `r2.py` added. After Sketchfab upload succeeds, also push GLB to Cloudflare R2 at `cases/{uid}.glb` (best-effort — R2 failure does not break the request). Same UID, two storage backends.
-- **Sprint 3 (next):** Rewrite `medCaseViewer/case/` from Sketchfab iframe to native Three.js + GLTFLoader reading from R2. Sketchfab becomes optional/removed. Public URL (`?id=...`) stays identical — clinicians with old links keep working.
+- **Sprint 3 ✅:** `medCaseViewer/case/` rewritten from the Sketchfab iframe to Three.js + GLTFLoader reading from R2, with the Sketchfab iframe kept as read-only fallback for pre-Sprint-2 cases (`/case/legacy/`). **3c (2026-09-27):** Sketchfab removed from this service — R2 is the only destination, uids are minted here, `/status` is gone. Public URL (`?id=...`) stays identical — clinicians with old links keep working.
+- **Sprint 3d ✅:** image exam (DICOM/NRRD → canonical NRRD in R2, up to 4 series per case) — see "Image exam".
 - **Future (after AI pipeline):** A separate `ai-segmentation` service will produce STLs from DICOM and POST them to this service's `/upload` endpoint. This service does not need to know whether the STL came from a human upload or an AI run.
 
 The canonical, cross-service version of this roadmap lives in the workspace-level `CLAUDE.md` (one folder up). If the two ever disagree, that one wins.
@@ -384,6 +364,6 @@ The canonical, cross-service version of this roadmap lives in the workspace-leve
 ## What this service is NOT responsible for
 
 - AI segmentation (separate service, not built yet). DICOM *normalization* to the canonical NRRD does live here (`exam.py`), because it is storage preparation for the viewer, not analysis.
-- Authentication or user accounts (out of scope; unguessable Sketchfab UIDs are the access control for now).
+- Authentication or user accounts (out of scope; unguessable case UIDs are the access control for now).
 - Storing case metadata (patient name, exam date, etc.) — when this is needed, add a Postgres on Railway and a separate `cases` service. Do not bolt it onto this one.
 - Frontend rendering / Three.js / measurement tools (lives in the `medCaseViewer` repo).
