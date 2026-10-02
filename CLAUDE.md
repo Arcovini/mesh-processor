@@ -133,6 +133,12 @@ These defaults exist because this is **medical/surgical data**, not generic 3D c
 | `pele` | `#FFD09C` | pele (skin tone) |
 | `cortex` | `#966830` | córtex (brown) |
 
+The table above is illustrative — `COLORS_BY_KEYWORD` in `processor.py` is the source of truth (it also has `rins`/`kidney`/`renal`, `osso`, and the order rules).
+
+**English names (since 2026-10-02).** Automatic segmentations (TotalSegmentator, 3D Slicer) export English names, which used to fall into the fallback palette (a case arrived with blue `Bones` and a blue `stomach`). Each organ now has its Portuguese and English keyword on the same hex: `lesion`, `skin`, `bone`, and the abdomen organs `figado`/`liver`, `baco`/`spleen`, `estomago`/`stomach`, `duoden`, `esofag`/`esophag`. Names are **not** translated — the viewer shows the name the file came with.
+
+**The hex is written raw into `baseColorFactor`, which glTF reads as linear**, so on screen a color looks lighter than its hex (`#EAE3D2` bone shows as `#F6F2EA`). For the abdomen organs the color was chosen by what the viewer shows, so their hexes are dark (liver `#450B06` shows as `#8E3A2A`); the on-screen color is noted next to each entry. Dark bases sit near `_vary_hsv`'s V floor (0.30), so duplicates of liver/spleen differ less than duplicates of the bright colors.
+
 Non-matched names cycle through an IBM Colorblind Safe palette (`FALLBACK_COLORS`) by index — deterministic, so the same name consistently gets the same color. To add/change a clinical category, edit `COLORS_BY_KEYWORD`; don't touch the fallback palette lightly — reordering it reshuffles colors for unmatched cases.
 
 **Duplicates share a "color bucket" and get HSV-varied.** When two or more meshes resolve to the same base hex (two `art`-prefixed structures, or `lesao` + `tumor` in the same case, or fallback palette wrapping past index 4), `_vary_hsv` walks each duplicate through progressively darker V with alternating S offsets. The first occurrence keeps the base color; subsequent ones stay visually distinguishable in the viewer's toggle list without losing the clinical meaning of the hue. Bucketing is per-hex, not per-keyword, which is why `tumor` mapping to the same green as `lesao` works correctly out of the box.

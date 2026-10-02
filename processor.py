@@ -47,17 +47,39 @@ DEFAULT_TARGET_TRIANGLES = 300_000
 #    não marrom de rim). Vale inclusive sobre `art`/`vei`.
 #  - `art`/`vei` em seguida: "arteria renal" / "veia renal" leem como vaso.
 #  - `renal`/`renais` por último: adjetivo genérico, não deve roubar `cortex`.
+#
+# Segmentações automáticas (TotalSegmentator, 3D Slicer) exportam os nomes em
+# inglês: cada órgão tem a keyword em português e em inglês, no mesmo hex (mesmo
+# bucket → duas do mesmo órgão variam em HSV). Sem isso "Bones" e "stomach"
+# caíam na paleta de fallback e saíam azuis.
+#
+# O hex é gravado cru no baseColorFactor, que o glTF lê como linear: na tela a
+# cor aparece mais clara que o hex. Nos órgãos do abdome a cor foi escolhida
+# pelo que se vê no visualizador (anotada em cada linha), por isso o hex é
+# escuro.
 COLORS_BY_KEYWORD: dict[str, str] = {
     "tumor": "#08E700",   # tumor: verde brilhante
     "lesao": "#08E700",   # lesão: mesmo verde do tumor (compartilha bucket → varia HSV)
-    "art": "#BD0006",     # artéria: vermelho escuro
+    "lesion": "#08E700",  # lesion (EN)
+    "art": "#BD0006",     # artéria / artery: vermelho escuro
     "vei": "#477EFF",     # veia / vein: azul
     "rim": "#BA5531",     # rim: marrom-alaranjado
     "rins": "#BA5531",    # rins: o plural não contém "rim", precisa de entrada própria
     "kidney": "#BA5531",  # kidney(s): mesmo marrom do rim (mesmo bucket → varia HSV)
     "pele": "#DC8576",    # pele: rosado avermelhado
+    "skin": "#DC8576",    # skin (EN)
     "cortex": "#966830",  # córtex: marrom
-    "osso": "#EAE3D2",    # osso: marfim / off-white (mais claro que a pele)
+    "osso": "#EAE3D2",    # osso(s): marfim / off-white (mais claro que a pele)
+    "bone": "#EAE3D2",    # bone(s) (EN)
+    "figado": "#450B06",    # fígado: marrom-avermelhado (na tela #8E3A2A)
+    "liver": "#450B06",
+    "baco": "#41144E",      # baço: roxo (na tela #8A4F96)
+    "spleen": "#41144E",
+    "estomago": "#BA4333",  # estômago: rosado (na tela #DE8C7C)
+    "stomach": "#BA4333",
+    "duoden": "#C4801B",    # duodeno / duodenum: amarelo-ocre (na tela #E3BC5C)
+    "esofag": "#95230C",    # esôfago: terracota (na tela #C9683C)
+    "esophag": "#95230C",   # esophagus / oesophagus (EN)
     "renal": "#BA5531",   # renal / renais (PT e EN): adjetivo do rim, mesmo marrom —
     "renais": "#BA5531",  # por último de propósito (ver bloco de ordem acima)
 }

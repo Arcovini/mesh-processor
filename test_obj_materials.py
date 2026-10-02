@@ -16,7 +16,7 @@ import pytest
 import trimesh
 from PIL import Image
 
-from processor import process_obj_bundle, process_stls
+from processor import FALLBACK_COLORS, process_obj_bundle, process_stls
 
 # --- OBJ builders --------------------------------------------------------------
 
@@ -232,6 +232,49 @@ def test_tumor_outranks_vessel_keywords_too():
     _, stats = process_stls([("Arteria do Tumor", stl_bytes), ("Veia do Tumor", stl_bytes)])
     assert [m.color.upper() for m in stats.meshes][0] == "#08E700"
     assert all(m.color.upper() != "#BD0006" for m in stats.meshes)
+
+
+@pytest.mark.parametrize(
+    "pt,en,expected",
+    [
+        ("Ossos", "Bones", "#EAE3D2"),
+        ("Pele", "skin", "#DC8576"),
+        ("Lesao PET", "Lesion PET", "#08E700"),
+        ("Figado", "liver", "#450B06"),
+        ("Baco", "spleen", "#41144E"),
+        ("Estomago", "stomach", "#BA4333"),
+        ("Duodeno", "duodenum", "#C4801B"),
+        ("Esofago", "esophagus", "#95230C"),
+    ],
+)
+def test_english_names_get_the_same_color_as_portuguese(pt, en, expected):
+    """Segmentação automática exporta em inglês: o órgão sai na mesma cor nas duas línguas."""
+    for name in (pt, en):
+        _, stats = process_stls([(name, _box_stl())])
+        assert stats.meshes[0].color.upper() == expected, name
+
+
+def test_english_abdomen_case_uses_no_fallback_color():
+    """O caso que motivou a mudança: nomes em inglês não podem cair na paleta de fallback."""
+    names = ["Bones", "duodenum", "esophagus", "Lesao PET", "liver", "spleen", "stomach"]
+    _, stats = process_stls([(n, _box_stl()) for n in names])
+    colors = [m.color.upper() for m in stats.meshes]
+    assert not set(colors) & {c.upper() for c in FALLBACK_COLORS}
+    assert len(set(colors)) == len(names)
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("Tumor de Figado", "#08E700"),       # lesão vence o órgão hospedeiro
+        ("stomach tumor", "#08E700"),
+        ("Arteria Hepatica do Figado", "#BD0006"),  # vaso vence o órgão
+        ("liver vein", "#477EFF"),
+    ],
+)
+def test_new_organs_keep_the_precedence_rules(name, expected):
+    _, stats = process_stls([(name, _box_stl())])
+    assert stats.meshes[0].color.upper() == expected
 
 
 @pytest.mark.parametrize("name", ["Adrenal", "Glandula Suprarrenal", "Adrenais"])
