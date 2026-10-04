@@ -303,6 +303,38 @@ def _process_meshes(
     # the colour-by-keyword path (STL) and the preserve-texture path (OBJ) are
     # fundamentally different and combining them produces a confusing result.
     exts = {_ext(n) for n, _ in file_pairs}
+    if ".nhdr" in exts:
+        raise HTTPException(
+            400,
+            "Este NRRD tem os dados num arquivo separado (.nhdr + .raw). "
+            "Exporte como um único arquivo .nrrd.",
+        )
+    # Segmentação em NRRD (labelmap / .seg.nrrd do 3D Slicer): cada estrutura
+    # vira uma malha, ao lado de STLs se vierem juntos. O volume de IMAGEM vai
+    # no campo `exam`; aqui só entra o que a página classificou como segmentação.
+    if ".nrrd" in exts:
+        if not exts <= {".stl", ".nrrd"}:
+            raise HTTPException(
+                400,
+                "Uma segmentação em NRRD só pode vir junto de arquivos STL, não de um bundle OBJ.",
+            )
+        if _parse_boolean_ops(boolean_ops, [n for n, _ in file_pairs]):
+            raise HTTPException(
+                400,
+                "A divisão de estruturas está disponível apenas para envios só de arquivos STL.",
+            )
+        stl_pairs = [(n, b) for n, b in file_pairs if _ext(n) == ".stl"]
+        seg_pairs = [(n, b) for n, b in file_pairs if _ext(n) == ".nrrd"]
+        mesh_names = clean_mesh_names([n for n, _ in stl_pairs]) if stl_pairs else []
+        try:
+            return process_stls(
+                list(zip(mesh_names, [b for _, b in stl_pairs])),
+                target_triangles_per_mesh=target_triangles,
+                segmentations=seg_pairs,
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
     is_obj_bundle = ".obj" in exts or ".zip" in exts
     is_stl_only = exts == {".stl"}
 
@@ -339,8 +371,8 @@ def _process_meshes(
 
     raise HTTPException(
         400,
-        "Tipo de arquivo não reconhecido. Envie arquivos .stl ou um bundle OBJ "
-        "(.obj + .mtl + imagem, soltos ou em .zip).",
+        "Tipo de arquivo não reconhecido. Envie arquivos .stl, uma segmentação .nrrd "
+        "ou um bundle OBJ (.obj + .mtl + imagem, soltos ou em .zip).",
     )
 
 

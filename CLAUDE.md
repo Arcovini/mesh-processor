@@ -26,12 +26,11 @@ uvicorn main:app --reload --port 8000
 
 For most dev work, `DRY_RUN=true` in `.env` is enough — see "DRY_RUN" below.
 
-Tests (pytest; the dev extras bring pytest, httpx for FastAPI's TestClient and
-scikit-image for `scripts/nrrd_to_stl.py`):
+Tests (pytest; the dev extras bring pytest and httpx for FastAPI's TestClient):
 
 ```bash
 pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q test_exam.py test_upload_exam.py test_boolean.py test_obj_materials.py
+.venv/bin/python -m pytest -q test_exam.py test_upload_exam.py test_boolean.py test_obj_materials.py test_segmentation.py
 ```
 
 From Claude Code, the workspace `.claude/launch.json` has `mesh-processor-dry`:
@@ -84,8 +83,10 @@ mesh-processor/
 ├── processor.py     # STL(s) → scene → multi-mesh GLB (pure, testable, no I/O)
 ├── r2.py            # Cloudflare R2 client (S3-compatible via boto3). Thin. DRY_RUN short-circuit inside.
 ├── exam.py          # Image exam (DICOM series / zip / NRRD) → canonical NRRD (pure, no I/O)
+├── segmentation.py  # Segmentation NRRD (labelmap / Slicer .seg.nrrd) → one closed mesh per structure (pure)
+├── test_segmentation.py  # pytest: segmentation.py, the NRRD path of process_stls and /upload
 ├── test_exam.py, test_upload_exam.py  # pytest: exam.py and the `exam` field end to end
-├── scripts/nrrd_to_stl.py  # dev only: marching-cubes STL from a NRRD + the sphere test pair (and its 2nd series)
+├── scripts/nrrd_to_stl.py  # dev only: marching-cubes STL from a NRRD + the sphere test pair (and its 2nd series, and its segmentation: --seg)
 ├── scripts/upload_fixtures.py  # dev only: the multi-series DICOM fixtures of medCaseViewer/tests/upload
 ├── test_processor.py  # Informal smoke test against real STLs (not pytest)
 ├── .env.example     # Template for VIEWER_BASE, R2_*, EXAM_WRITE_SECRET, DRY_RUN
@@ -285,8 +286,57 @@ structures only, exam only, or both.
 - **Decoders:** `pydicom` + `pylibjpeg`, `pylibjpeg-libjpeg`, `pylibjpeg-openjpeg`,
   `pylibjpeg-rle` (compressed series from PACS; cp312 wheels, nothing to
   compile). No `python-gdcm`.
-- **Future (asked by the user):** a segmentation NRRD (labelmap) becoming 3D
-  structures via marching cubes. Today NRRD/DICOM is image only.
+- A segmentation NRRD becomes 3D structures, not an exam — see the next section.
+
+### Segmentation NRRD → structures (`segmentation.py`)
+
+A case can come from NRRDs alone (user request, 2026-10-04): the **segmentation**
+NRRD goes in `files` and becomes the 3D, the **image** NRRD goes in `exam` as
+before. The upload page decides which is which (`medCaseViewer/upload/nrrd-kind.js`):
+Slicer `SegmentN_*` header fields, a 4D `kinds: list …` volume or a `.seg.nrrd`
+name → segmentation; otherwise by the values (non-negative integers with ≤ 64
+distinct values; ≤ 128 when the name says label/mask/seg). Here a `.nrrd` in
+`files` is always read as a segmentation and refused in Portuguese if it looks
+like an image (negative or non-integer values, > `MAX_SEGMENTS` = 128 values).
+
+- **Formats:** 3D Slicer `.seg.nrrd` (names, sRGB colors, `LabelValue`, `Layer`;
+  4D with the layer axis first when segments overlap; pre-4.11 files with one
+  segment per layer and no `LabelValue`) and plain labelmaps (ITK-SNAP, nnU-Net,
+  TotalSegmentator, a binary mask). Names: the Slicer name (transliterated like
+  STL names; **read from the raw header bytes as UTF-8** — pynrrd decodes the
+  header as ASCII and drops accents, "Útero" became "tero"); a plain labelmap
+  with one structure takes the file name without `-label`/`_mask`/`.seg`; with
+  several, "Segmento <valor>". Segments declared but empty are skipped.
+- **Geometry:** the same as the exam (`space directions`/`space origin`, RAS/LAS
+  → LPS via `exam._SPACES`), so the mesh sits exactly on the slices when the
+  image comes along; then `process_stls` applies the usual `_RAS_TO_GLTF`.
+  Marching cubes runs in index space on each structure's bounding box
+  (`scipy.ndimage.find_objects`, one pass), then vertices go to mm. A negative
+  determinant or the (k,j,i)→(i,j,k) swap would turn it inside out: the sign of
+  the volume decides `invert()`.
+- **Smoothing (decided 2026-10-04):** unlike STLs (never smoothed), a labelmap
+  surface is a staircase of voxels — artifact, not anatomy. Gaussian blur of the
+  mask (σ = 0.8 voxel per axis, 0.5 for thin structures that lose > 40 % at 0.8,
+  e.g. ribs), then marching cubes at the **level where the mesh volume equals the
+  voxel volume** (± 0.5 %, Newton steps on the level): the viewer's Volume then
+  reads the same as Slicer's Segment Statistics, and a 1-voxel-thick structure
+  survives instead of vanishing. Measured and rejected: Taubin (λ 0.5 / μ −0.53,
+  10 passes) shrank a 5-voxel sphere 25 %; a fixed level 0.5 after blur lost 74 %
+  of the ribs of the Slicer sample. The pad of zeros around the box keeps every
+  mesh closed (Volume needs it), even when a structure touches the volume edge.
+- **Colors:** keyword > the file's own color > fallback palette
+  (`_name_based_material(own_color=…)`): an artery is red in every case whatever
+  color the segmentation tool picked; with no keyword the Slicer color is kept,
+  converted sRGB → linear (`_srgb_hex_to_linear_hex`) so the viewer shows the
+  color the clinician saw in Slicer (palette hexes stay raw, as before).
+- **Mixing:** STLs and segmentation NRRDs can go together (STLs first, then each
+  file's segments; repeated names get " 2"). `boolean_ops` with a NRRD present →
+  400 (the split UI is STL-only). OBJ + NRRD → 400. The 60 MB `files` cap applies.
+- **Tests:** `test_segmentation.py` (oblique, non-cubic synthetic volumes; the
+  centroid in LPS catches a swapped axis or a mirror) and, on real data, the
+  slicerio sample (`pip download slicerio`: `CTChest4.nrrd` +
+  `Segmentation.seg.nrrd` / `SegmentationOverlapping.seg.nrrd`): 7–8 closed
+  structures in < 1 s, volumes within 4 % of the voxel count.
 
 ### Required: force vertex-normal compute after transforms
 
@@ -299,8 +349,9 @@ structures only, exam only, or both.
 ### Input limits
 
 - **Image exam: per request 200 MB / 900 loose files / one series; 4 series per case; 16 M voxels per series after downsampling.** See "Image exam" above.
+- **Segmentation NRRD:** up to 128 structures per file; the same 600 MB decompressed cap as the exam NRRD (`exam.MAX_NRRD_INPUT_BYTES`).
 - **Max STL size: 60MB.** Set in `main.py`. STLs larger than this should not exist in our pipeline (segmentation output is capped upstream). If they do, fail loudly — silently truncating clinical data is dangerous.
-- **STL only for now.** OBJ/PLY/etc. could be added but are not in scope.
+- **STL, OBJ bundle or segmentation NRRD.** PLY etc. could be added but are not in scope.
 
 ### Sketchfab (removed in Sprint 3c)
 
