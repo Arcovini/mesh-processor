@@ -20,7 +20,7 @@ os.environ.setdefault("DRY_RUN", "true")
 
 import nrrd  # noqa: E402
 
-from processor import _RAS_TO_GLTF, process_stls  # noqa: E402
+from processor import _RAS_TO_GLTF, _decimate, _is_closed, process_stls  # noqa: E402
 from segmentation import MAX_SEGMENTS, segments_from_nrrd  # noqa: E402
 
 A = np.deg2rad(12)
@@ -158,6 +158,144 @@ def test_limit_is_on_structures_not_on_dtype():
 def test_not_a_nrrd_is_refused():
     with pytest.raises(ValueError, match="NRRD inválido"):
         segments_from_nrrd(b"solid nada\nendsolid\n", "x.nrrd")
+
+
+# ---- Estruturas finas e em ilhas ----------------------------------------------
+# Casos de uma RM fetal real (2026-10-04) que o desfoque e a busca do nível
+# erravam: uma casca de 1 voxel de espessura saía com 45 % a menos de volume,
+# e as ilhas pequenas de uma estrutura sumiam (o volume ia para as outras). As
+# máscaras são construídas nos índices: "1 voxel" é a espessura que importa.
+
+
+def _index_mask(fn, shape=SHAPE_IJK):
+    ni, nj, nk = shape
+    k, j, i = np.meshgrid(np.arange(nk), np.arange(nj), np.arange(ni), indexing="ij")
+    return fn(i.astype(float), j.astype(float), k.astype(float)).astype(np.uint8)
+
+
+def _one_segment(data):
+    (seg,) = segments_from_nrrd(_nrrd_bytes(data), "estrutura.nrrd")
+    vox = seg.voxels * _voxel_volume()
+    return seg, (seg.mesh.volume - vox) / vox
+
+
+def test_one_voxel_shell_keeps_its_volume_and_its_wall():
+    # Esfera oca, parede de 1 voxel (|r − R| ≤ ½): ligada só em diagonal em
+    # boa parte dela — a 0,8 de desfoque a parede sai furada.
+    data = _index_mask(lambda i, j, k: np.abs(np.sqrt((i - 34) ** 2 + (j - 30) ** 2 + (k - 25) ** 2) - 20) <= 0.5)
+    seg, error = _one_segment(data)
+    assert abs(error) < 0.05
+    assert _is_closed(seg.mesh.vertices, seg.mesh.faces)
+    # Parede inteira: a superfície de fora e a de dentro, sem furo entre elas.
+    assert seg.mesh.body_count == 2 and seg.mesh.euler_number == 4
+
+
+@pytest.mark.parametrize("name, fn", [
+    ("placa de 1 voxel", lambda i, j, k: (k == 25) & (np.abs(i - 34) < 18) & (np.abs(j - 30) < 18)),
+    ("fio de 1 voxel", lambda i, j, k: (i == 34) & (j == 30) & (np.abs(k - 25) < 20)),
+])
+def test_thin_structure_keeps_its_volume(name, fn):
+    seg, error = _one_segment(_index_mask(fn))
+    assert abs(error) < 0.02, name
+    assert _is_closed(seg.mesh.vertices, seg.mesh.faces), name
+    assert seg.mesh.body_count == 1, name
+
+
+def test_small_islands_are_all_kept():
+    """Uma estrutura em pedaços (o cordão em ilhas): cada ilha fica, no lugar."""
+    ball = lambda i, j, k: (i - 34) ** 2 + (j - 30) ** 2 + (k - 25) ** 2 <= 10 ** 2  # noqa: E731
+    data = _index_mask(ball)
+    corners = [(i, j, k) for i in (8, 58) for j in (8, 50) for k in (6, 42)]
+    for i, j, k in corners:
+        data[k:k + 2, j:j + 2, i:i + 2] = 1  # 8 voxels cada
+    seg, error = _one_segment(data)
+    assert abs(error) < 0.01
+    assert seg.mesh.body_count == 1 + len(corners)
+    world = _world_grid()
+    centroid = world[data.astype(bool)].mean(axis=0)
+    assert np.linalg.norm(seg.mesh.center_mass - centroid) < 0.5
+
+
+# ---- Decimação mantém a malha fechada -------------------------------------------
+# O fast_simplification não checa topologia: onde a estrutura é mais fina que
+# as arestas novas, as duas faces dela colapsam uma na outra e a malha abre
+# (num caso real, 618 mil → 300 mil triângulos). Aberta, o volume do
+# visualizador vira "~" e o Cortar recusa a estrutura.
+
+
+def _thin_blob_mesh():
+    """Ruído desfocado e cortado: paredes e pontes de 1–3 voxels. Com esta
+    semente, decimar para a metade sem cuidado abre a malha."""
+    from scipy.ndimage import gaussian_filter
+
+    from segmentation import _surface
+
+    field = gaussian_filter(np.random.default_rng(2).random((40, 40, 40)), 2)
+    mask = field > field.min() + 0.5 * (field.max() - field.min())
+    mask[:2] = mask[-2:] = False
+    mask[:, :2] = mask[:, -2:] = False
+    mask[:, :, :2] = mask[:, :, -2:] = False
+    return _surface(mask, [0, 0, 0], np.eye(3), np.zeros(3))
+
+
+def test_is_closed_counts_edges_by_position_like_the_viewer():
+    a = trimesh.creation.box()
+    assert _is_closed(a.vertices, a.faces)
+    # Duas caixas encostadas por uma aresta, cada uma com os seus vértices:
+    # fechadas pelos índices, mas a aresta comum tem 4 triângulos na posição.
+    b = trimesh.creation.box()
+    b.apply_translation([1.0, 1.0, 0.0])
+    both = trimesh.util.concatenate([a, b])
+    assert both.is_watertight
+    assert not _is_closed(both.vertices, both.faces)
+
+
+def test_decimation_keeps_a_closed_mesh_closed():
+    mesh = _thin_blob_mesh()
+    assert _is_closed(mesh.vertices, mesh.faces)
+    target = len(mesh.faces) // 2
+    out, input_tris, decimated = _decimate(mesh, target)
+    assert decimated and input_tris == len(mesh.faces)
+    assert len(out.faces) <= target
+    assert _is_closed(out.vertices, out.faces)
+    assert abs(out.volume - mesh.volume) / mesh.volume < 0.01
+
+
+def test_decimation_falls_back_when_simplify_opens_the_mesh(monkeypatch):
+    """Se o colapso deixa a malha aberta mesmo sem as faces dobradas, o plano B
+    (Manifold.simplify) decima sem abrir."""
+    import processor
+
+    real = processor.fast_simplification.simplify
+
+    def opening(points, faces, **kw):
+        p, f = real(points, faces, **kw)
+        return p, f[3:]  # três triângulos a menos: um furo
+
+    monkeypatch.setattr(processor.fast_simplification, "simplify", opening)
+    mesh = trimesh.creation.icosphere(subdivisions=6, radius=30.0)
+    target = len(mesh.faces) // 4
+    out, _, decimated = _decimate(mesh, target)
+    assert decimated
+    assert _is_closed(out.vertices, out.faces)
+    assert len(out.faces) <= target
+    assert abs(out.volume - mesh.volume) / mesh.volume < 0.01
+
+
+def test_decimated_segmentation_is_closed_in_the_glb():
+    """De ponta a ponta: o que o visualizador lê do GLB (float32) fecha."""
+    from scipy.ndimage import gaussian_filter
+
+    field = gaussian_filter(np.random.default_rng(2).random((40, 40, 40)), 2)
+    data = (field > field.min() + 0.5 * (field.max() - field.min())).astype(np.uint8)
+    data[:2] = data[-2:] = 0
+    blob = _nrrd_bytes(data, directions=np.eye(3) * 0.5, origin=np.zeros(3))
+    glb, stats = process_stls([], target_triangles_per_mesh=22_000,
+                              segmentations=[("pontes.nrrd", blob)])
+    (m,) = stats.meshes
+    assert m.decimated
+    (mesh,) = _glb_nodes(glb).values()
+    assert _is_closed(mesh.vertices, mesh.faces)
 
 
 # ---- .seg.nrrd do 3D Slicer -------------------------------------------------------

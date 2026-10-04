@@ -319,14 +319,108 @@ def _load_and_decimate(
 
 def _decimate(mesh: trimesh.Trimesh, target_triangles: int) -> tuple[trimesh.Trimesh, int, bool]:
     input_tris = len(mesh.faces)
-    if input_tris > target_triangles:
-        points_out, faces_out = fast_simplification.simplify(
-            mesh.vertices, mesh.faces, target_count=target_triangles
+    if input_tris <= target_triangles:
+        return mesh, input_tris, False
+    # Malha fechada continua fechada: o volume do visualizador e o Cortar
+    # (Manifold) dependem disso. O fast_simplification (colapso de arestas por
+    # quádricas) não checa topologia: onde a estrutura é mais fina que as
+    # arestas novas, as duas faces dela colapsam uma na outra. Visto num caso
+    # real (RM fetal, 2026-10-04): 618 mil → 300 mil triângulos abriu uma
+    # estrutura de 432 mL.
+    closed = _is_closed(mesh.vertices, mesh.faces)
+    points_out, faces_out = fast_simplification.simplify(
+        mesh.vertices, mesh.faces, target_count=target_triangles
+    )
+    if closed:
+        faces_out = _drop_folded_pairs(faces_out)
+    # process=True recomputes per-vertex normals (needed for smooth shading after decimation)
+    out = trimesh.Trimesh(vertices=points_out, faces=faces_out, process=True)
+    if closed and not _is_closed(out.vertices, out.faces):
+        out = _simplify_keeping_closed(mesh, target_triangles) or out
+    return out, input_tris, True
+
+
+def _is_closed(vertices: np.ndarray, faces: np.ndarray) -> bool:
+    """Cada aresta em exatamente 2 triângulos — a conta do visualizador
+    (`computeMeshVolumeForMesh`): vértices por posição em float32, como o GLB
+    guarda, não por índice."""
+    if len(faces) == 0:
+        return False
+    _, ids = np.unique(np.asarray(vertices, dtype=np.float32), axis=0, return_inverse=True)
+    f = ids.reshape(-1)[np.asarray(faces)]
+    edges = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
+    keys = edges[:, 0].astype(np.int64) * (int(f.max()) + 1) + edges[:, 1]
+    _, counts = np.unique(keys, return_counts=True)
+    return bool(np.all(counts == 2))
+
+
+def _drop_folded_pairs(faces: np.ndarray) -> np.ndarray:
+    """Tira os triângulos repetidos (os mesmos 3 vértices, em qualquer ordem).
+
+    É o que sobra de uma parte fina colapsada: um par de faces costas com
+    costas, volume zero, que deixa cada aresta dele em 4 triângulos. Tirar as
+    duas cópias devolve 2 triângulos a cada aresta e não muda o volume.
+    """
+    faces = np.asarray(faces)
+    if not len(faces):
+        return faces
+    _, inverse, counts = np.unique(
+        np.sort(faces, axis=1), axis=0, return_inverse=True, return_counts=True
+    )
+    return faces[counts[inverse.reshape(-1)] == 1]
+
+
+# Plano B da decimação: Manifold.simplify colapsa arestas sem quebrar a
+# topologia e sem mover a superfície mais que a tolerância (mm). A tolerância
+# cresce até a malha caber no alvo, mas para no teto: acima dele uma estrutura
+# fina perde forma (num teste sem teto, 17 % do volume), e uma malha mais pesada
+# que o alvo é melhor que uma deformada.
+_CLOSED_SIMPLIFY_START_MM = 0.02
+_CLOSED_SIMPLIFY_GROWTH = 1.6
+_CLOSED_SIMPLIFY_MAX_MM = 0.5
+
+
+def _simplify_keeping_closed(
+    mesh: trimesh.Trimesh, target_triangles: int
+) -> trimesh.Trimesh | None:
+    """Decimação que mantém a malha fechada, quando o fast_simplification abriu.
+
+    Fica com a primeira que cabe no alvo; se nenhuma tolerância até o teto
+    chega lá sem abrir, devolve a mais leve que fechou (mais triângulos que o
+    alvo: fechada e fiel importa mais que leve). None se o Manifold recusar a
+    malha.
+    """
+    import manifold3d
+
+    try:
+        source = manifold3d.Manifold(
+            manifold3d.Mesh(
+                vert_properties=np.ascontiguousarray(mesh.vertices, dtype=np.float32),
+                tri_verts=np.ascontiguousarray(mesh.faces, dtype=np.uint32),
+            )
         )
-        # process=True recomputes per-vertex normals (needed for smooth shading after decimation)
-        mesh = trimesh.Trimesh(vertices=points_out, faces=faces_out, process=True)
-        return mesh, input_tris, True
-    return mesh, input_tris, False
+    except Exception:
+        return None
+    if source.status() != manifold3d.Error.NoError:
+        return None
+    tolerance = _CLOSED_SIMPLIFY_START_MM
+    best = None
+    while True:
+        out = source.simplify(tolerance).to_mesh()
+        candidate = trimesh.Trimesh(
+            vertices=np.asarray(out.vert_properties)[:, :3],
+            faces=np.asarray(out.tri_verts),
+            process=True,
+        )
+        # O Manifold mantém a topologia duplicando o vértice onde duas partes
+        # encostam: fechada pelos índices, beliscada pelas posições.
+        if not _is_closed(candidate.vertices, candidate.faces):
+            break
+        best = candidate
+        if len(candidate.faces) <= target_triangles or tolerance >= _CLOSED_SIMPLIFY_MAX_MM:
+            break
+        tolerance = min(tolerance * _CLOSED_SIMPLIFY_GROWTH, _CLOSED_SIMPLIFY_MAX_MM)
+    return best
 
 
 # Engine das operações booleanas do trimesh. `manifold` (lib manifold3d) é o
