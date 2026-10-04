@@ -3,5 +3,3 @@
 pytest
 # TestClient do FastAPI (test_upload_exam.py).
 httpx
-# scripts/nrrd_to_stl.py (marching cubes para gerar STLs de validação).
-scikit-image

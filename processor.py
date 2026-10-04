@@ -191,14 +191,30 @@ def _vary_hsv(hex_color: str, index: int) -> str:
     return f"#{int(round(r * 255)):02X}{int(round(g * 255)):02X}{int(round(b * 255)):02X}"
 
 
+def _srgb_hex_to_linear_hex(hex_color: str) -> str:
+    """Cor como a tela mostra (sRGB) → o valor linear que o baseColorFactor espera.
+
+    Só para cores que vêm de fora com a intenção "é esta a cor na tela" (a cor de
+    um segmento do 3D Slicer). As da paleta já são escritas em hex de fator.
+    """
+    def lin(c: float) -> float:
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    return _rgb01_to_hex(tuple(lin(c) for c in _hex_to_rgb01(hex_color)))
+
+
 def _name_based_material(
-    name: str, bucket_counts: dict[str, int], fallback_idx: int
+    name: str, bucket_counts: dict[str, int], fallback_idx: int, own_color: str | None = None
 ) -> tuple[str, PBRMaterial, int]:
     """Color + PBR finish for a mesh that has no material of its own, from its name.
 
     Single source of name-based coloring for BOTH STL meshes and material-less OBJ
     objects: `metal` → polished silver/titanium (full metalness, low roughness);
-    other keyword → palette color; unmatched → cycling fallback palette. Duplicates
+    other keyword → palette color; unmatched → the structure's own color when the
+    file carried one (a 3D Slicer segment, `own_color` in sRGB), else the cycling
+    fallback palette. The keyword wins over the file's color on purpose: an
+    artery is red in every case, whatever color the segmentation tool picked.
+    Duplicates
     of a base hex are HSV-varied via `bucket_counts` so they stay distinguishable.
 
     Returns (color_hex, material, next_fallback_idx).
@@ -212,6 +228,8 @@ def _name_based_material(
         base_hex = METAL_COLOR
     elif keyword_hex is not None:
         base_hex = keyword_hex
+    elif own_color is not None:
+        base_hex = _srgb_hex_to_linear_hex(own_color)
     else:
         base_hex = FALLBACK_COLORS[fallback_idx % len(FALLBACK_COLORS)]
         fallback_idx += 1
@@ -296,6 +314,10 @@ def _load_and_decimate(
     if _ras_header_to_lps(stl_bytes):
         mesh.apply_transform(_RAS_TO_LPS)
 
+    return _decimate(mesh, target_triangles)
+
+
+def _decimate(mesh: trimesh.Trimesh, target_triangles: int) -> tuple[trimesh.Trimesh, int, bool]:
     input_tris = len(mesh.faces)
     if input_tris > target_triangles:
         points_out, faces_out = fast_simplification.simplify(
@@ -342,6 +364,9 @@ class _LoadedMesh:
     # escolhida: o nome composto contém as duas estruturas e casaria com a
     # keyword errada ("Veia fora de Tumor" pegaria o verde do tumor).
     color_name: str = ""
+    # Cor que veio no próprio arquivo (segmento do 3D Slicer), sRGB "#RRGGBB".
+    # Só vale quando o nome não casa com a paleta (ver `_name_based_material`).
+    own_color: str | None = None
 
     def __post_init__(self):
         if not self.color_name:
@@ -428,14 +453,20 @@ def process_stls(
     files: list[tuple[str, bytes]],
     target_triangles_per_mesh: int = DEFAULT_TARGET_TRIANGLES,
     boolean_ops: list[tuple[str, str]] | None = None,
+    segmentations: list[tuple[str, bytes]] | None = None,
 ) -> tuple[bytes, ProcessStats]:
     """Build a single multi-mesh GLB from a list of (name, stl_bytes).
 
     `boolean_ops` é uma lista de pares (referência, estrutura a dividir) por
     nome de estrutura — ver `_apply_boolean_ops`. Roda após a decimação (malhas
     já lean) e antes da rotação RAS→glTF e da coloração.
+
+    `segmentations` são NRRDs de segmentação (filename, bytes): cada estrutura
+    de cada arquivo vira uma malha (`segmentation.segments_from_nrrd`), depois
+    dos STLs, e segue o mesmo caminho deles — decimação, rotação, cor (a cor do
+    segmento no Slicer vale quando o nome não casa com a paleta).
     """
-    if not files:
+    if not files and not segmentations:
         raise ValueError("Nenhum arquivo recebido.")
 
     loaded: list[_LoadedMesh] = []
@@ -444,6 +475,21 @@ def process_stls(
             stl_bytes, target_triangles_per_mesh
         )
         loaded.append(_LoadedMesh(name, mesh, input_tris, decimated))
+
+    used = {lm.name for lm in loaded}
+    for filename, data in segmentations or []:
+        from segmentation import segments_from_nrrd  # só o caminho NRRD paga o import
+
+        for seg in segments_from_nrrd(data, filename):
+            name, n = seg.name, 2
+            while name in used:  # nome de nó repetido some no glTF
+                name = f"{seg.name} {n}"
+                n += 1
+            used.add(name)
+            mesh, input_tris, decimated = _decimate(seg.mesh, target_triangles_per_mesh)
+            loaded.append(
+                _LoadedMesh(name, mesh, input_tris, decimated, own_color=seg.color)
+            )
 
     if boolean_ops:
         loaded = _apply_boolean_ops(loaded, boolean_ops)
@@ -474,13 +520,13 @@ def process_stls(
         origin = lm.isolated_from
         if origin is None:
             color_hex, material, fallback_idx = _name_based_material(
-                lm.color_name, bucket_counts, fallback_idx
+                lm.color_name, bucket_counts, fallback_idx, lm.own_color
             )
         else:
             origin_hex = colors_by_mesh.get(id(origin))
             if origin_hex is None:
                 origin_hex, _, fallback_idx = _name_based_material(
-                    origin.color_name, bucket_counts, fallback_idx
+                    origin.color_name, bucket_counts, fallback_idx, origin.own_color
                 )
             color_hex, material = _isolated_piece_material(origin_hex, bucket_counts)
         material.name = name

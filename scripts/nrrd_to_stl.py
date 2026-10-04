@@ -22,6 +22,17 @@ Dois usos:
    exam-ct.nrrd: uma TC mínima em Hounsfield (ar −1000, corpo 40, vaso 300,
    osso 800) para os presets de janela do visualizador.
 
+3) A segmentação da mesma esfera, para o caminho "só NRRD" (segmentation.py):
+
+       .venv/bin/python scripts/nrrd_to_stl.py --seg <pasta>
+
+   Grava exam-sphere.seg.nrrd (labelmap no espaço de exam-sphere.nrrd, com o
+   cabeçalho de segmentos do 3D Slicer: "Esfera" = 1 e "Núcleo" = 2, uma
+   esfera de 8 mm no centro, nome em UTF-8 como o Slicer grava),
+   exam-sphere-seg.glb (essa segmentação passada pelo processor.py, igual a um
+   upload) e esfera-rotulos.nrrd (o mesmo labelmap sem cabeçalho nem nome que
+   diga "segmentação": a página tem de reconhecer pelos valores).
+
 O STL sai com o cabeçalho `3D Slicer output. SPACE=LPS`, como o Slicer grava.
 Precisa de requirements-dev.txt (scikit-image).
 """
@@ -190,6 +201,54 @@ def sphere_series2(out_dir: str) -> None:
     print(f"{out_dir}: exam-sphere-fase2.nrrd ({len(out)} B, {stats.shape})")
 
 
+def seg_fixture(out_dir: str) -> None:
+    import nrrd
+
+    os.makedirs(out_dir, exist_ok=True)
+    ni, nj, nk = 64, 56, 48  # a geometria de exam-sphere.nrrd
+    sp = np.array([1.2, 1.5, 2.0])
+    a = np.deg2rad(12)
+    rot = np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+    directions = (rot @ np.diag(sp)).T
+    center_idx = np.array([(ni - 1) / 2, (nj - 1) / 2, (nk - 1) / 2]) + np.array([3, -2, 1])
+    origin = SPHERE_CENTER_LPS - center_idx @ directions
+
+    k, j, i = np.meshgrid(np.arange(nk), np.arange(nj), np.arange(ni), indexing="ij")
+    ijk = np.stack([i, j, k], axis=-1).reshape(-1, 3).astype(np.float64)
+    dist = np.linalg.norm(origin + ijk @ directions - SPHERE_CENTER_LPS, axis=1).reshape(nk, nj, ni)
+    labels = np.zeros((nk, nj, ni), dtype=np.uint8)
+    labels[dist <= SPHERE_RADIUS_MM] = 1
+    labels[dist <= 8.0] = 2
+
+    def write(header_extra: dict) -> bytes:
+        raw = io.BytesIO()
+        nrrd.write(raw, labels, {
+            "space": "left-posterior-superior",
+            "space directions": directions,
+            "space origin": origin,
+            "kinds": ["domain"] * 3,
+            "encoding": "gzip",
+            **header_extra,
+        }, index_order="C")
+        return raw.getvalue()
+
+    seg = write({
+        "Segment0_ID": "Segment_1", "Segment0_Name": "Esfera", "Segment0_Color": "0.85 0.55 0.45",
+        "Segment0_LabelValue": "1", "Segment0_Layer": "0",
+        "Segment1_ID": "Segment_2", "Segment1_Name": "NUCLEO", "Segment1_Color": "0.3 0.5 0.9",
+        "Segment1_LabelValue": "2", "Segment1_Layer": "0",
+    }).replace(b":=NUCLEO", ":=Núcleo".encode())  # o pynrrd só escreve ASCII
+    with open(os.path.join(out_dir, "exam-sphere.seg.nrrd"), "wb") as f:
+        f.write(seg)
+    with open(os.path.join(out_dir, "esfera-rotulos.nrrd"), "wb") as f:
+        f.write(write({}))
+    glb, stats = process_stls([], segmentations=[("exam-sphere.seg.nrrd", seg)])
+    with open(os.path.join(out_dir, "exam-sphere-seg.glb"), "wb") as f:
+        f.write(glb)
+    print(f"{out_dir}: exam-sphere.seg.nrrd ({len(seg)} B), esfera-rotulos.nrrd, "
+          f"exam-sphere-seg.glb ({len(glb)} B): {[(m.name, m.output_triangles) for m in stats.meshes]}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("nrrd", nargs="?", help="exame .nrrd de entrada")
@@ -199,9 +258,12 @@ def main() -> None:
     p.add_argument("--level", type=float, help="limiar absoluto (ignora --percentile)")
     p.add_argument("--step", type=int, default=2, help="passo do marching cubes (padrão 2)")
     p.add_argument("--sphere", metavar="PASTA", help="gera o par sintético da esfera")
+    p.add_argument("--seg", metavar="PASTA", help="gera a segmentação NRRD da esfera")
     args = p.parse_args()
     if args.sphere:
         sphere(args.sphere)
+    elif args.seg:
+        seg_fixture(args.seg)
     elif args.nrrd and args.out:
         from_nrrd(args.nrrd, args.out, args.percentile, args.level, args.step)
     else:
