@@ -115,6 +115,7 @@ These defaults exist because this is **medical/surgical data**, not generic 3D c
 
 - **Target triangle count: 300,000 per mesh** (not per scene). Preserves anatomical detail (fractures, calcifications, vessel branches) while keeping each structure lean. Configurable per request via `target_triangles` form field.
 - **Decimation algorithm: `fast_simplification` (quadric edge collapse).** Chosen over `pymeshlab` (heavy install, GPL) and `trimesh.simplify_quadric_decimation` (slower, less stable on large meshes).
+- **A closed mesh stays closed after decimation** (`_decimate`; the viewer's Volume and Cortar need it). `fast_simplification` has no topology check: where a structure is thinner than the new edges its two sides collapse onto each other (a real fetal case opened at 618k → 300k). After it, face pairs on the same three vertices (a collapsed sliver, zero volume) are dropped; if the mesh is still open, plan B is `Manifold.simplify` (`_simplify_keeping_closed`: tolerance from 0.02 mm, ×1.6, capped at 0.5 mm), keeping the lightest result that closes — above the target if need be: closed and faithful beats light. "Closed" is `_is_closed`: every edge in exactly 2 triangles **counting vertices by float32 position**, the same count as the viewer's `computeMeshVolumeForMesh` — Manifold keeps itself manifold by duplicating a vertex where two parts touch, which is closed by index and pinched by position. An input that was already open is decimated as before.
 - **No aggressive smoothing.** `trimesh.load(process=True)` does safe cleanup (duplicate vertices, normals). Anything more (Laplacian smoothing, Taubin) can round off clinically relevant features and is **off by default**. If a future request needs it, gate it behind an explicit flag, not a default.
 - **Coordinate system: STL is patient space, Z-up (LPS, the 3D Slicer default); glTF is Y-up.** We apply a fixed `-π/2` rotation around X so each mesh lands upright in the viewer (`_RAS_TO_GLTF` — the name is historical; no x/y sign flip happens, so the GLB is **LPS rotated**). The rotation is identical for every mesh in a batch, preserving inter-structure spatial relationships (a kidney, its artery, its vein, and a lesion from the same exam stay co-registered). An STL whose 80-byte header says `SPACE=RAS` (Slicer writes `SPACE=LPS` or `SPACE=RAS` there) is first rotated 180° about S (`diag(-1,-1,1)`) to LPS. The viewer applies the same rotation to the image exam (`medCaseViewer/case/exam-geom.js`) — **change both or neither**.
 - **Output format: GLB binary.** Smaller than glTF+bin, single file, native browser support; Three.js `GLTFLoader` reads it directly.
@@ -316,14 +317,34 @@ like an image (negative or non-integer values, > `MAX_SEGMENTS` = 128 values).
   the volume decides `invert()`.
 - **Smoothing (decided 2026-10-04):** unlike STLs (never smoothed), a labelmap
   surface is a staircase of voxels — artifact, not anatomy. Gaussian blur of the
-  mask (σ = 0.8 voxel per axis, 0.5 for thin structures that lose > 40 % at 0.8,
-  e.g. ribs), then marching cubes at the **level where the mesh volume equals the
-  voxel volume** (± 0.5 %, Newton steps on the level): the viewer's Volume then
-  reads the same as Slicer's Segment Statistics, and a 1-voxel-thick structure
-  survives instead of vanishing. Measured and rejected: Taubin (λ 0.5 / μ −0.53,
-  10 passes) shrank a 5-voxel sphere 25 %; a fixed level 0.5 after blur lost 74 %
-  of the ribs of the Slicer sample. The pad of zeros around the box keeps every
-  mesh closed (Volume needs it), even when a structure touches the volume edge.
+  mask (σ in voxels per axis), then marching cubes at the **level where the mesh
+  volume equals the voxel volume** (± 0.5 %): the viewer's Volume then reads the
+  same as Slicer's Segment Statistics, and a 1-voxel-thick structure survives
+  instead of vanishing. The level search (`_levels_for_volume`) starts from the
+  quantile of the field that holds that many voxels and corrects it by the
+  measured mesh − count residual, inside a bracket (false position when a step
+  would leave it). The Newton step it replaced assumed a straight edge's slope and
+  diverged on a 1-voxel wall: a real fetal shell came out 45 % short (−96 % in
+  the synthetic test). A level never equals a voxel value (`_marching` nudges it
+  to the next float32): vertices on the grid made degenerate triangles, and
+  dropping them left a hole.
+  **Which σ:** 0.8, then 0.5, then 0.35 (almost no blur) — the first whose mesh
+  still represents the mask: no island of ≥ `MIN_ISLAND_VOXELS` (8) vanishes,
+  and the mesh's total genus is ≤ the mask's (digital 26/6 topology), i.e. the
+  blur opened no hole through a wall. Smaller islands are brush speckles and may
+  go. With an exact volume only on a perforated mesh (the level sits where a
+  1-voxel wall's diagonal links break: the saddle between two diagonal voxels is
+  below 0.5), a faithful one within 10 % wins; at the last σ the level steps down
+  (thicker wall) until one is faithful. A 1-voxel wall's volume is uncertain by
+  half a voxel per side anyway; a perforated or shattered shell is just wrong.
+  Synthetic 1-voxel spherical shells (R 20–90 voxels) come out whole within
+  +1–5 %; the R 90 one (610k triangles, like the real case) takes ~30 s. Measured
+  and rejected: Taubin (λ 0.5 / μ −0.53, 10 passes) shrank a 5-voxel sphere 25 %;
+  a fixed level 0.5 after blur lost 74 % of the ribs of the Slicer sample;
+  requiring 99 % of the voxels inside the surface dropped the smoothing of the
+  Slicer sample's lung (98.9 % at 0.8, lost only at thin edges). The pad of zeros
+  around the box keeps every mesh closed (Volume needs it), even when a
+  structure touches the volume edge.
 - **Colors:** keyword > the file's own color > fallback palette
   (`_name_based_material(own_color=…)`): an artery is red in every case whatever
   color the segmentation tool picked; with no keyword the Slicer color is kept,
@@ -335,8 +356,10 @@ like an image (negative or non-integer values, > `MAX_SEGMENTS` = 128 values).
 - **Tests:** `test_segmentation.py` (oblique, non-cubic synthetic volumes; the
   centroid in LPS catches a swapped axis or a mirror) and, on real data, the
   slicerio sample (`pip download slicerio`: `CTChest4.nrrd` +
-  `Segmentation.seg.nrrd` / `SegmentationOverlapping.seg.nrrd`): 7–8 closed
-  structures in < 1 s, volumes within 4 % of the voxel count.
+  `Segmentation.seg.nrrd` / `SegmentationOverlapping.seg.nrrd`, also in
+  `medCaseViewer/tests/upload/fixtures/slicer/`): 7 closed structures in ~3 s,
+  volumes within 0.5 % of the voxel count. Thin and island cases (1-voxel shell,
+  plate, wire; 8-voxel islands) are synthetic, from what a real fetal MRI showed.
 
 ### Required: force vertex-normal compute after transforms
 

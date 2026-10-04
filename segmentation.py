@@ -57,13 +57,32 @@ MAX_SEGMENTS = 128
 # voxels (± LEVEL_TOLERANCE) — o mesmo número que a "Segment Statistics" do
 # Slicer mostra, e o que a medida de volume do visualizador vai dar. Uma
 # estrutura de um voxel de espessura sobrevive (o nível desce) em vez de sumir.
-# Estrutura fina (costela de 1–2 voxels) perde mais da metade no desfoque de
-# 0,8: abaixo de THIN_FRACTION do volume no nível 0,5, tenta o σ seguinte.
-SMOOTH_SIGMAS_VOXELS = (0.8, 0.5)
-THIN_FRACTION = 0.6
+#
+# Um σ só vale se a malha ainda representa a máscara: nenhuma ilha de
+# MIN_ISLAND_VOXELS ou mais some, e a malha não abre furos que a máscara não
+# tem (gênero). Senão tenta o σ seguinte, menor. Casos reais que pedem isso (RM
+# fetal, 2026-10-04): uma casca de 1 voxel de espessura, que a 0,8 sai furada,
+# e estruturas em várias ilhas pequenas (vasos do cordão). O último σ quase não
+# desfoca: degrau, mas fiel. Ilha menor que MIN_ISLAND_VOXELS é respingo do
+# pincel e pode sumir: não vale trocar a suavização da estrutura inteira por
+# ela. Medido e descartado: exigir 99 % dos voxels cobertos tirava a
+# suavização de um pulmão (98,9 % a 0,8, só nas bordas finas).
+SMOOTH_SIGMAS_VOXELS = (0.8, 0.5, 0.35)
+MIN_ISLAND_VOXELS = 8
 SMOOTH_PAD = 3
-LEVEL_STEPS = 4
+LEVEL_STEPS = 8
 LEVEL_TOLERANCE = 0.005
+LEVEL_FLOOR = 0.02  # fração do pico do campo: abaixo disto a busca não desce
+# Quando o volume exato só sai com a malha furada (o nível cai bem onde as
+# ligações em diagonal de uma parede de 1 voxel se rompem: o ponto de sela
+# entre dois voxels em diagonal fica abaixo de 0,5), aceita até isto de
+# diferença numa malha fiel. No último σ, se nenhuma tentativa serviu, desce o
+# nível de FAITHFUL_STEP em FAITHFUL_STEP (parede mais grossa) até ficar fiel.
+# Numa parede de 1 voxel o volume é incerto em meio voxel de cada lado de
+# qualquer jeito; uma casca furada ou em pedaços não é.
+VOLUME_SLACK = 0.10
+FAITHFUL_STEP = 0.02
+FAITHFUL_STEPS = 5
 
 _SEGMENT_KEY = re.compile(r"^Segment(\d+)_(\w+)$")
 # "feto-label", "Segmentation", "rim_mask"… → a palavra que só diz "isto é uma
@@ -340,38 +359,69 @@ def _surface(
     """Máscara (k, j, i) recortada → malha fechada e suave em LPS (mm).
 
     Desfoque gaussiano da máscara e marching cubes no nível em que o volume da
-    malha bate com o dos voxels. Tudo em unidades de índice (1 voxel = 1), e só
-    no fim a malha vai para mm.
+    malha bate com o dos voxels; σ menor quando o desfoque deixaria de
+    representar a máscara. Tudo em unidades de índice (1 voxel = 1), e só no
+    fim a malha vai para mm.
     """
+    from scipy import ndimage
     from scipy.ndimage import gaussian_filter
 
-    voxels = float(mask.sum())
+    voxels = int(mask.sum())
     if voxels == 0:
         return None
     # Borda de zeros maior que o alcance do desfoque: a estrutura que encosta
     # na borda do volume também fecha.
-    padded = np.pad(mask, SMOOTH_PAD).astype(np.float32)
+    padded = np.pad(mask, SMOOTH_PAD)
+    source = padded.astype(np.float32)
+    # Ilhas (26-conexas) com tamanho que conta: cada uma precisa aparecer.
+    labels, n_parts = ndimage.label(padded, structure=np.ones((3, 3, 3)))
+    island_of = labels[padded]
+    sizes = np.bincount(island_of, minlength=n_parts + 1)
+    islands = sizes >= MIN_ISLAND_VOXELS
+    islands[0] = False
+    mask_genus: list[int] = []  # calculado só se alguma malha tiver furo
+
+    def faithful(field_inside: np.ndarray, mesh: trimesh.Trimesh, level: float) -> bool:
+        if n_parts > 1:
+            shown = np.bincount(island_of[field_inside >= level], minlength=n_parts + 1)
+            if np.any(islands & (shown == 0)):
+                return False  # uma ilha sumiu no desfoque (e o volume dela foi para as outras)
+        genus = _mesh_genus(mesh)
+        if genus == 0:
+            return True
+        if not mask_genus:
+            mask_genus.append(_mask_genus(padded, n_parts))
+        return genus <= mask_genus[0]  # senão furou uma parede que a máscara tem inteira
+
     mesh = None
-    for n, sigma in enumerate(SMOOTH_SIGMAS_VOXELS):
-        field = gaussian_filter(padded, sigma)
-        peak = float(field.max())
-        level = min(0.5, 0.5 * peak)
-        mesh = _marching(field, level)
-        if mesh is None:
+    for sigma in SMOOTH_SIGMAS_VOXELS:
+        field = gaussian_filter(source, sigma)
+        candidates = _levels_for_volume(field, voxels)
+        if not candidates:
             continue
-        if abs(mesh.volume) < THIN_FRACTION * voxels and n + 1 < len(SMOOTH_SIGMAS_VOXELS):
-            continue  # o desfoque comeu a estrutura: fina demais para este σ
-        for _ in range(LEVEL_STEPS - 1):
-            volume = abs(mesh.volume)
-            if abs(volume - voxels) <= LEVEL_TOLERANCE * voxels or mesh.area == 0:
-                break
-            # Passo de Newton: falta (sobra) uma casca de espessura ΔV/A
-            # voxels; na borda desfocada o campo cai 1/(σ√2π) por voxel.
-            gap = (voxels - volume) / mesh.area
-            level = level - gap / (sigma * np.sqrt(2 * np.pi))
-            level = float(np.clip(level, 0.05 * peak, min(0.7, 0.9 * peak)))
-            mesh = _marching(field, level) or mesh
-        break
+        candidates.sort(key=lambda c: abs(c[2] - voxels))
+        mesh = candidates[0][0]  # o σ menor fica com o volume mais próximo, se nenhum servir
+        inside = field[padded]
+        chosen = next(
+            (
+                c for c in candidates
+                if abs(c[2] - voxels) <= VOLUME_SLACK * voxels and faithful(inside, c[0], c[1])
+            ),
+            None,
+        )
+        if chosen is None and sigma == SMOOTH_SIGMAS_VOXELS[-1]:
+            level = candidates[0][1]
+            for _ in range(FAITHFUL_STEPS):
+                level -= FAITHFUL_STEP
+                thicker = _marching(field, level)
+                if thicker is None or abs(thicker.volume) > (1 + VOLUME_SLACK) * voxels:
+                    break
+                if faithful(inside, thicker, level):
+                    chosen = (thicker, level, abs(thicker.volume))
+                    break
+        if chosen is not None:
+            mesh = chosen[0]
+            break
     if mesh is None or len(mesh.faces) == 0:
         return None
 
@@ -385,9 +435,83 @@ def _surface(
     return mesh
 
 
+def _levels_for_volume(field: np.ndarray, target: int) -> list[tuple[trimesh.Trimesh, float, float]]:
+    """Busca o nível do marching cubes em que o volume da malha dá `target`
+    voxels; devolve cada tentativa (malha, nível, volume).
+
+    O volume cai quando o nível sobe. Chute: o nível acima do qual há `target`
+    voxels do campo (um quantil, sem marching cubes). A malha difere dessa
+    contagem por um resíduo que muda devagar com o nível, então cada passo
+    refaz o quantil descontando o resíduo medido. O intervalo [lo, hi] sempre
+    contém a resposta: um passo que sairia dele, ou que viria depois de dois
+    seguidos do mesmo lado, vira falsa posição entre as pontas. (O passo de Newton com a
+    inclinação de uma borda reta, usado antes, errava longe numa parede de 1
+    voxel, em que o campo mal passa do nível: a casca saía com 4 % do volume.)
+    """
+    peak = float(field.max())
+    values = np.sort(field[field > LEVEL_FLOOR * peak])  # crescente
+    if not len(values):
+        return []
+
+    def quantile(count: float) -> float:
+        n = int(np.clip(round(count), 1, len(values)))
+        return float(values[len(values) - n])
+
+    lo, hi = LEVEL_FLOOR * peak, peak
+    v_lo, v_hi = None, 0.0  # acima do pico não há nada
+    level = quantile(target)
+    tried: list[tuple[trimesh.Trimesh, float, float]] = []
+    sides = ""
+    for _ in range(LEVEL_STEPS):
+        mesh = _marching(field, level)
+        volume = 0.0 if mesh is None else abs(mesh.volume)
+        if mesh is not None:
+            tried.append((mesh, level, volume))
+            if abs(volume - target) <= LEVEL_TOLERANCE * target:
+                break
+        if volume > target:
+            lo, v_lo, sides = level, volume, sides + "l"
+        else:
+            hi, v_hi, sides = level, volume, sides + "h"
+        above = len(values) - np.searchsorted(values, level, side="left")
+        level = quantile(target - (volume - above))
+        if not lo < level < hi or sides[-2:] in ("ll", "hh"):
+            if v_lo is None:
+                level = (lo + hi) / 2
+            else:
+                level = lo + (v_lo - target) / (v_lo - v_hi) * (hi - lo)
+    return tried
+
+
+def _mesh_genus(mesh: trimesh.Trimesh) -> int:
+    """Soma dos gêneros das superfícies fechadas da malha (furos que a atravessam)."""
+    return max(0, int(round(mesh.body_count - mesh.euler_number / 2)))
+
+
+def _mask_genus(mask: np.ndarray, parts: int) -> int:
+    """O mesmo número para a máscara, pela topologia digital (26/6-conexa).
+
+    Superfícies = ilhas do objeto (`parts`) + cavidades (fundo fechado dentro
+    dele); gênero total = superfícies − característica de Euler do sólido.
+    A máscara chega com borda de zeros, então o fundo de fora é um só.
+    """
+    from scipy import ndimage
+    from skimage.measure import euler_number
+
+    _, background = ndimage.label(~mask)
+    return max(0, parts + background - 1 - int(euler_number(mask, connectivity=3)))
+
+
 def _marching(field: np.ndarray, level: float) -> trimesh.Trimesh | None:
     from skimage.measure import marching_cubes
 
+    # Nível igual ao valor de um voxel põe vértices em cima da grade: triângulos
+    # degenerados, que saem e deixam um furo na malha. O quantil da busca de
+    # nível é sempre um valor do campo, então anda para o float32 seguinte.
+    level32 = np.float32(level)
+    while np.any(field == level32):
+        level32 = np.nextafter(level32, np.float32(np.inf))
+    level = float(level32)
     try:
         verts_kji, faces, _, _ = marching_cubes(field, level=level, allow_degenerate=False)
     except (ValueError, RuntimeError):
