@@ -18,6 +18,20 @@ coronal de 10 fatias com 1 imagem LOCALIZER axial na mesma série, como a
 Siemens grava — a referência fica de fora), misto.zip (um STL e uma imagem
 DICOM juntos: a página pede para separar) e stl.zip (STL compactado: a página
 pede para descompactar).
+
+Com --pareamento grava só o par que testa o aviso "segmentação de outra série"
+da página (as outras fixtures ficam como estão):
+
+    obliqua/                  série DICOM oblíqua de 12 imagens 20×14, pixel
+                              0,8 × 0,7 mm (nada simétrico para esconder um eixo
+                              trocado)
+    obliqua-rotulos.nrrd      labelmap na grade que exam.py lê dessa série
+    obliqua-recorte.seg.nrrd  a mesma máscara como o 3D Slicer grava um recorte:
+                              grade própria menor, e a do volume em que foi
+                              desenhada em "Reference image geometry" (RAS)
+
+A geometria vem de exam.normalize_exam, não da página: o teste compara as duas
+leituras.
 """
 from __future__ import annotations
 
@@ -119,5 +133,65 @@ def main(out: str) -> None:
     print(f"{out}: multi/ (5 séries), multi.zip, crua/, mpr/, misto.zip, stl.zip")
 
 
+OBLIQUE_IOP = (0.8660254, 0.5, 0.0, -0.4698463, 0.8137977, 0.3420201)  # 30° no plano, 20° de inclinação
+
+
+def pairing(out: str) -> None:
+    import nrrd
+
+    from exam import normalize_exam
+
+    d = os.path.join(out, "obliqua")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    uid = generate_uid()
+    items = []
+    for k in range(12):
+        px = (np.arange(20 * 14, dtype=np.int16).reshape(20, 14) + k * 7).astype(np.int16)
+        data = make_slice(k, series_uid=uid, description="OBLIQUA T2", iop=OBLIQUE_IOP,
+                          origin=(12.5, -40.0, 70.0), frame_of_reference=FOR_A, pixels=px)
+        items.append((f"IM{k + 1:04d}", data))
+        with open(os.path.join(d, f"IM{k + 1:04d}"), "wb") as f:
+            f.write(data)
+
+    canon, _ = normalize_exam(items)
+    tmp = os.path.join(out, ".obliqua-canonica.nrrd")
+    with open(tmp, "wb") as f:
+        f.write(canon)
+    vol, h = nrrd.read(tmp, index_order="C")
+    os.remove(tmp)
+    labels = np.zeros(vol.shape, dtype=np.uint8)  # (k, j, i)
+    labels[3:9, 5:14, 4:10] = 1
+    base = {k: h[k] for k in ("space", "space directions", "space origin", "kinds")}
+    nrrd.write(os.path.join(out, "obliqua-rotulos.nrrd"), labels, {**base, "encoding": "gzip"}, index_order="C")
+
+    dirs = np.asarray(h["space directions"], dtype=float)  # linhas: eixos i, j, k
+    origin = np.asarray(h["space origin"], dtype=float)
+    lo = np.array([3, 4, 2])  # i, j, k (com 1 voxel de folga em volta da máscara)
+    hi = np.array([10, 14, 9])
+    crop = labels[lo[2]:hi[2] + 1, lo[1]:hi[1] + 1, lo[0]:hi[0] + 1]
+    ras = np.diag([-1.0, -1.0, 1.0])
+    m = np.eye(4)
+    m[:3, :3] = ras @ dirs.T
+    m[:3, 3] = ras @ origin
+    sizes = labels.shape[::-1]
+    ref = ";".join(f"{v:.17g}" for v in m.ravel()) + ";" + ";".join(f"0;{n - 1}" for n in sizes) + ";"
+    seg_header = {
+        **base,
+        "space origin": origin + lo @ dirs,
+        "encoding": "gzip",
+        "Segment0_ID": "Segment_1",
+        "Segment0_Name": "Lesao",
+        "Segment0_LabelValue": "1",
+        "Segment0_Layer": "0",
+        "Segmentation_ConversionParameters": f"Reference image geometry|{ref}|Image geometry description string.&",
+    }
+    nrrd.write(os.path.join(out, "obliqua-recorte.seg.nrrd"), crop, seg_header, index_order="C")
+    print(f"{out}: obliqua/ (12 imagens), obliqua-rotulos.nrrd, obliqua-recorte.seg.nrrd")
+
+
 if __name__ == "__main__":
-    main(sys.argv[1])
+    if sys.argv[1] == "--pareamento":
+        pairing(sys.argv[2])
+    else:
+        main(sys.argv[1])
